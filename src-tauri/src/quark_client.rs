@@ -323,7 +323,7 @@ pub async fn qr_get_cookie(st: &str) -> Result<Value, String> {
     // 重复/过期的 __puus、__uid —— 直接 join 会让上游收到两份同名 Cookie
     let mut cookie_str = build_cookie_header(&all_raw);
 
-    println!("[qrlogin/cookie] Step1 Cookie 字段: {}", extract_cookie_keys(&cookie_str));
+    log_line!("[qrlogin/cookie] Step1 Cookie 字段: {}", extract_cookie_keys(&cookie_str));
 
     // Step 2-4: 尝试补全 __puus
     let puus_steps = [
@@ -334,24 +334,24 @@ pub async fn qr_get_cookie(st: &str) -> Result<Value, String> {
 
     for (step, step_url) in puus_steps {
         if cookie_str.contains("__puus=") { break; }
-        println!("[qrlogin/cookie] 缺少 __puus, 尝试 {} ...", step);
+        log_line!("[qrlogin/cookie] 缺少 __puus, 尝试 {} ...", step);
         match fetch_with_cookies(step_url, all_raw.clone()).await {
             Ok(r) => {
                 if r.cookies.len() > all_raw.len() {
                     all_raw = r.cookies;
                     cookie_str = build_cookie_header(&all_raw);
-                    println!("[qrlogin/cookie] {} 新增 Cookie, 总字段: {}", step, extract_cookie_keys(&cookie_str));
+                    log_line!("[qrlogin/cookie] {} 新增 Cookie, 总字段: {}", step, extract_cookie_keys(&cookie_str));
                 } else {
-                    println!("[qrlogin/cookie] {} 未获取到新 Cookie", step);
+                    log_line!("[qrlogin/cookie] {} 未获取到新 Cookie", step);
                 }
             }
-            Err(e) => println!("[qrlogin/cookie] {} 失败: {}", step, e),
+            Err(e) => log_line!("[qrlogin/cookie] {} 失败: {}", step, e),
         }
     }
 
     let has_puus = cookie_str.contains("__puus=");
     if !has_puus {
-        println!("[qrlogin/cookie] 警告: 最终仍缺少 __puus, 下载功能可能受限");
+        log_line!("[qrlogin/cookie] 警告: 最终仍缺少 __puus, 下载功能可能受限");
     }
 
     let user_info: Value = serde_json::from_slice(&result.body).unwrap_or(Value::Null);

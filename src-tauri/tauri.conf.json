@@ -21,6 +21,11 @@
         "icon": [
             "icons/icon.ico",
             "icons/icon.png"
-        ]
+        ],
+        "windows": {
+            "webviewInstallMode": {
+                "type": "embedBootstrapper"
+            }
+        }
     }
 }

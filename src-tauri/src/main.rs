@@ -1,6 +1,26 @@
 // 在 release 模式下隐藏 Windows 控制台窗口
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// ── 日志宏 ───────────────────────────────────────────────
+// release 版是 GUI 子系统程序：用户双击启动时进程没有控制台，
+// stdout/stderr 句柄无效，此时 `log_line!` 会因为写失败而 panic
+// （"failed printing to stdout: The handle is invalid"），表现为
+// 窗口一闪而过、程序直接退出。所以日志一律用下面这两个宏，
+// 写失败就静默忽略；从终端/重定向启动时行为与 log_line! 完全一致。
+macro_rules! log_line {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+macro_rules! log_err {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod api_server;
 mod quark_client;
 mod settings;
@@ -344,14 +364,14 @@ async fn follow_redirects(
                         return Err(format!("重定向目标被拒绝: {} ({})", e, next_url));
                     }
                     if next_host != current_host && !current_cookie.is_empty() {
-                        println!(
+                        log_line!(
                             "[download] 跳转到不同主机 {:?}，已剥离 Cookie",
                             next_host
                         );
                         current_cookie.clear();
                     }
                     current_host = next_host;
-                    println!(
+                    log_line!(
                         "[download] 重定向 #{}: {}...",
                         redirects + 1,
                         &next_url[..next_url.len().min(80)]
@@ -392,7 +412,7 @@ fn resolve_download_dir(app: &tauri::AppHandle) -> PathBuf {
             return path;
         }
         // 目录被删/盘符掉线等情况：不要让下载直接失败，回退到系统默认并留下日志
-        eprintln!("[settings] 配置的下载目录不可用，回退到系统默认: {}", dir);
+        log_err!("[settings] 配置的下载目录不可用，回退到系统默认: {}", dir);
     }
 
     app.path()
@@ -453,7 +473,7 @@ async fn set_download_dir(
     }
 
     settings::write_settings(&config_dir(&app), &current)?;
-    println!("[settings] 下载目录已更新: {:?}", current.download_dir);
+    log_line!("[settings] 下载目录已更新: {:?}", current.download_dir);
 
     Ok(settings_view(&app))
 }
@@ -485,7 +505,7 @@ async fn cancel_downloads() -> Result<serde_json::Value, String> {
     DOWNLOAD_PAUSED.store(false, Ordering::SeqCst);
     clear_all_tasks();
     let old = DOWNLOAD_EPOCH.fetch_add(1, Ordering::SeqCst);
-    println!("[download] 取消下载 (epoch {} → {})", old, old + 1);
+    log_line!("[download] 取消下载 (epoch {} → {})", old, old + 1);
     Ok(serde_json::json!({ "cancelled": true }))
 }
 
@@ -493,7 +513,7 @@ async fn cancel_downloads() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn pause_task(task_id: String) -> Result<serde_json::Value, String> {
     set_task_paused(&task_id, true);
-    println!("[download] 任务 {} 已暂停", task_id);
+    log_line!("[download] 任务 {} 已暂停", task_id);
     Ok(serde_json::json!({ "taskId": task_id, "paused": true }))
 }
 
@@ -501,7 +521,7 @@ async fn pause_task(task_id: String) -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn resume_task(task_id: String) -> Result<serde_json::Value, String> {
     set_task_paused(&task_id, false);
-    println!("[download] 任务 {} 已恢复", task_id);
+    log_line!("[download] 任务 {} 已恢复", task_id);
     Ok(serde_json::json!({ "taskId": task_id, "paused": false }))
 }
 
@@ -509,7 +529,7 @@ async fn resume_task(task_id: String) -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn cancel_task(task_id: String) -> Result<serde_json::Value, String> {
     set_task_cancelled(&task_id);
-    println!("[download] 任务 {} 已取消", task_id);
+    log_line!("[download] 任务 {} 已取消", task_id);
     Ok(serde_json::json!({ "taskId": task_id, "cancelled": true }))
 }
 
@@ -517,7 +537,7 @@ async fn cancel_task(task_id: String) -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn pause_downloads() -> Result<serde_json::Value, String> {
     DOWNLOAD_PAUSED.store(true, Ordering::SeqCst);
-    println!("[download] 已暂停（任务挂起，进度保留）");
+    log_line!("[download] 已暂停（任务挂起，进度保留）");
     Ok(serde_json::json!({ "paused": true }))
 }
 
@@ -525,7 +545,7 @@ async fn pause_downloads() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn resume_downloads() -> Result<serde_json::Value, String> {
     DOWNLOAD_PAUSED.store(false, Ordering::SeqCst);
-    println!("[download] 已恢复下载");
+    log_line!("[download] 已恢复下载");
     Ok(serde_json::json!({ "paused": false }))
 }
 
@@ -636,7 +656,7 @@ async fn do_download(
     // 排队中的文件若在暂停期间被启动，先挂起等恢复
     wait_if_paused(&download_id, epoch).await?;
 
-    println!("[download] 开始: {} -> {:?} (epoch={})", filename, save_path, epoch);
+    log_line!("[download] 开始: {} -> {:?} (epoch={})", filename, save_path, epoch);
 
     let client = build_client()?;
     let (final_url, resp) = follow_redirects(&client, &url, &cookie).await?;
@@ -669,7 +689,7 @@ async fn do_download(
         .map(|s| s.contains("bytes"))
         .unwrap_or(false);
 
-    println!(
+    log_line!(
         "[download] CDN 200, 大小: {} ({:.1} MB), 支持 Range: {}",
         total_size,
         total_size as f64 / 1024.0 / 1024.0,
@@ -678,11 +698,11 @@ async fn do_download(
 
     if accept_ranges && total_size >= MIN_MULTITHREAD_SIZE {
         drop(resp);
-        println!("[download] 启用 {} 线程并行下载", thread_count);
+        log_line!("[download] 启用 {} 线程并行下载", thread_count);
         download_multithread(app, client, final_url, cookie, filename, save_path, total_size, epoch, download_id, thread_count)
             .await
     } else {
-        println!("[download] 使用单线程下载 (Range 不支持或文件较小)");
+        log_line!("[download] 使用单线程下载 (Range 不支持或文件较小)");
         download_single(app, resp, filename, save_path, total_size, epoch, download_id).await
     }
 }
@@ -721,7 +741,7 @@ async fn download_multithread(
     let thread_count = segments.len();
 
     for (i, (s, e)) in segments.iter().enumerate() {
-        println!(
+        log_line!(
             "[download] 段{}: {}-{} ({:.1} MB)",
             i,
             s,
@@ -807,7 +827,7 @@ async fn download_multithread(
 
     if !errors.is_empty() {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-        println!("[download] 已清理临时目录: {:?}", temp_dir);
+        log_line!("[download] 已清理临时目录: {:?}", temp_dir);
         return Err(format!("多线程下载失败:\n{}", errors.join("\n")));
     }
 
@@ -819,7 +839,7 @@ async fn download_multithread(
 
     // 8. 合并分片到最终文件（暂停期间不进入合并，避免暂停时还在写大文件）
     wait_if_paused(&download_id, epoch).await?;
-    println!("[download] 合并 {} 个分片到最终文件...", thread_count);
+    log_line!("[download] 合并 {} 个分片到最终文件...", thread_count);
     let _ = app.emit(
         "download-progress",
         serde_json::json!({
@@ -877,7 +897,7 @@ async fn download_multithread(
 
     // 11. 清理临时目录（TempDirGuard 亦会兜底）
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-    println!("[download] 临时文件已清理");
+    log_line!("[download] 临时文件已清理");
 
     // 最终进度
     let _ = app.emit(
@@ -920,7 +940,7 @@ async fn download_segment(
         if attempt > 1 {
             // 退避后重试：重置进度，避免监视器把重试算成"倒退"
             progress.store(0, Ordering::Relaxed);
-            println!("[download] 段{} 第 {} 次尝试", index, attempt);
+            log_line!("[download] 段{} 第 {} 次尝试", index, attempt);
             tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
         }
 
@@ -932,7 +952,7 @@ async fn download_segment(
                 if e.contains("下载已取消") {
                     return Err(e);
                 }
-                println!("[download] 段{} 失败: {}", index, e);
+                log_line!("[download] 段{} 失败: {}", index, e);
                 last_err = e;
             }
         }
@@ -1162,7 +1182,7 @@ async fn download_single_once(
         return Err("下载已取消".into());
     }
 
-    println!(
+    log_line!(
         "[download] 单线程完成: {} ({:.1} MB, {} bytes)",
         filename,
         downloaded as f64 / 1024.0 / 1024.0,
@@ -1174,7 +1194,66 @@ async fn download_single_once(
 
 // ── 主入口 ───────────────────────────────────────────────
 
+/// 弹出一个原生错误框（Windows 上直接调用 MessageBoxW，不引入任何新依赖）。
+/// release 版是 GUI 子系统程序，没有控制台，启动失败时用户什么都看不到，
+/// 这个弹窗是"双击没反应"唯一的自查线索。
+#[cfg(windows)]
+fn show_fatal_dialog(title: &str, text: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut core::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            u_type: u32,
+        ) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+
+    let text_w = wide(text);
+    let title_w = wide(title);
+    // SAFETY: 两个指针都指向以 NUL 结尾、在调用期间存活的 UTF-16 缓冲区
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_fatal_dialog(title: &str, text: &str) {
+    log_err!("[fatal] {}: {}", title, text);
+}
+
 fn main() {
+    // 把 panic 变成用户看得见的错误框：否则启动失败（WebView2 缺失、
+    // 数据目录不可写、被杀毒软件拦截等）时只会"一闪而过"，无法自查。
+    std::panic::set_hook(Box::new(|info| {
+        let detail = info.to_string();
+        log_err!("[fatal] {}", detail);
+        show_fatal_dialog(
+            "Quark Downloader Pro 启动失败",
+            &format!(
+                "应用遇到错误并已退出。\n\n{}\n\n\
+                 若为首次运行，请确认系统已安装 Microsoft Edge WebView2 运行时；\n\
+                 若提示拒绝访问，请检查杀毒软件是否拦截了本程序。",
+                detail
+            ),
+        );
+    }));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_os::init())
         // 目录选择对话框（"软件设置"里选下载目录用）
@@ -1211,7 +1290,7 @@ fn main() {
                 // 主 WebView 一旦被带到远程页面，那段远程内容就运行在应用的
                 // IPC 上下文里，是安全上最危险的场景，因此这里必须拒绝。
                 if !is_trusted_origin(url) {
-                    eprintln!("[security] 已阻止导航到非受信来源: {}", url);
+                    log_err!("[security] 已阻止导航到非受信来源: {}", url);
                     return false;
                 }
 
@@ -1221,7 +1300,7 @@ fn main() {
                 DOWNLOAD_PAUSED.store(false, Ordering::SeqCst);
                 clear_all_tasks();
                 let old = DOWNLOAD_EPOCH.fetch_add(1, Ordering::SeqCst);
-                println!(
+                log_line!(
                     "[download] 检测到页面导航/刷新，取消下载 (epoch {} → {})",
                     old,
                     old + 1
@@ -1232,7 +1311,7 @@ fn main() {
             .expect("创建主窗口失败");
 
             // 打印一次当前生效的下载目录，便于排查"文件下到哪去了"
-            println!("[settings] 下载目录: {:?}", resolve_download_dir(app.handle()));
+            log_line!("[settings] 下载目录: {:?}", resolve_download_dir(app.handle()));
 
             // 启动内嵌 HTTP 服务（axum）
             let port: u16 = std::env::var("PORT")
@@ -1240,7 +1319,7 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3000);
             if port != 3000 {
-                eprintln!(
+                log_err!(
                     "[quark-api] 警告: PORT={} 只改变后端监听端口，前端仍然固定请求 \
                      http://127.0.0.1:3000/api —— 除非用 VITE_API_BASE_URL 重新构建前端，\
                      否则所有请求都会失败",
@@ -1257,7 +1336,7 @@ fn main() {
                 let listener = match tokio::net::TcpListener::bind(&addr).await {
                     Ok(listener) => listener,
                     Err(e) => {
-                        eprintln!(
+                        log_err!(
                             "[quark-api] 启动失败: 无法监听 {} —— {}。\
                              该端口可能被其它程序（或本应用的另一个实例）占用；\
                              请关闭占用方后重启本应用，否则界面上的所有操作都会失败。",
@@ -1267,9 +1346,9 @@ fn main() {
                     }
                 };
 
-                println!("[quark-api] 内嵌服务已启动: http://{}", addr);
+                log_line!("[quark-api] 内嵌服务已启动: http://{}", addr);
                 if let Err(e) = axum::serve(listener, router).await {
-                    eprintln!("[quark-api] 内嵌服务异常退出: {}", e);
+                    log_err!("[quark-api] 内嵌服务异常退出: {}", e);
                 }
             });
 

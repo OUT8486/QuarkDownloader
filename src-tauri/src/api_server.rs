@@ -200,7 +200,7 @@ async fn api_proxy(
                     header::HeaderName::from_static("x-append-cookie"),
                     puus_val,
                 ));
-                println!("[api-proxy] 捕获到 __puus cookie!");
+                log_line!("[api-proxy] 捕获到 __puus cookie!");
             }
 
             let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::OK);
