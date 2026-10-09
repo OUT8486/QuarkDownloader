@@ -109,6 +109,23 @@
 - README：修正 tauri 版本说明（锁 2.12.2，不再声称"待升级"）、暂停语义（转存已发出时无法中断）、新增「常见问题」章节（端口占用 / 网盘残留 / 临时分片 / 日志位置）。
 - **更正一条先前的错误结论**：`core:window:allow-is-maximized` **不是**冗余授权 —— `TitleBar.tsx` 用 `appWindow.isMaximized()` 渲染最大化图标，删掉会导致权限拒绝、图标状态失效。已保留。
 
+### H. 发布阻断问题：release 版双击无法启动（已修复）
+
+**症状**：双击免安装 exe（或安装后双击图标）窗口一闪而过、或完全没有反应，没有任何错误提示。
+
+**根因**：release 构建带 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`，是 Windows **GUI 子系统**程序。用户双击启动时进程**没有控制台**，stdout/stderr 句柄无效；而 Rust 的 `println!` 在写入失败时会 panic（std 文档原文："Panics if writing to stdout fails"）。代码在窗口创建完成后立即执行 `println!("[settings] 下载目录: ...")`，于是**窗口刚出现就被 panic 终止** —— 表现正是"一闪而过"。
+
+**为什么之前的验证没发现**：dev 构建是控制台程序（该属性不生效）；而所有自动化验证（`tauri dev`、后台任务）都把 stdout 重定向到管道/文件，句柄有效 → 从不触发。
+
+**修复**：
+- 新增 `log_line!` / `log_err!` 宏：`writeln!` 的返回值直接丢弃，写失败静默忽略；从终端启动时行为与 `println!` 完全一致。共替换 32 处。
+- 新增 panic 钩子：启动失败时弹出**原生错误框**（`user32!MessageBoxW`，零新依赖），把"无声消失"变成用户可读的错误信息（附 WebView2 / 杀毒软件排查提示）。
+
+**打包修复**：
+- `webviewInstallMode` 改为 `embedBootstrapper`：安装时不再联网下载 WebView2 引导程序（此前会因下载超时导致**安装中途报错**）。
+- 三个产物改为**同一次构建**产出，修掉 MSI 比 exe 早 4.5 分钟的版本不一致。
+- 新增**免安装版 ZIP**（exe + `WebView2Loader.dll` + README）：单拷 exe 到别处会因缺少该 DLL 而无法启动。
+
 **仍未处理（有意为之，均为低危或需要你决策）**：安装包签名/公证、前端单 chunk 593 KB 拆包、macOS 图标集（`icon.png` 可由打包器合成 icns）、`tauri-plugin-log` 持久化日志、`target="_blank"` 外链点击无效（需引入 opener 插件）、`is_trusted_origin` 允许任意 localhost 端口（Tauri 内部仍将非 app/dev 来源判为 Remote，不可达 IPC）、合并过程本身不可中断。
 
 ### 本次验证（命令与结果）
