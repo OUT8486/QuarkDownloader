@@ -1,7 +1,5 @@
 # ── Node / 前端依赖与产物 ────────────────────────────────
 node_modules/
-frontend/node_modules/
-frontend/dist/
 dist/
 .vite/
 

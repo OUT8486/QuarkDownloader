@@ -14,7 +14,7 @@
 一个基于 **Tauri 2 + React 19** 构建的跨平台桌面应用，用于解析夸克网盘分享链接并批量下载文件。
 支持扫码登录、Cookie 登录（含后端校验）、递归目录解析、文件树展示、可调并发批量下载。
 
-**单文件绿色便携版** — 无需安装，双击即用；Windows 同时提供 MSI / NSIS 安装包  ☛[前往 Releases 下载](https://github.com/OP404OP/quarkdownloaderpro/releases)
+**绿色便携版** — 无需安装，双击即用（exe 与 `WebView2Loader.dll` 需放在同一目录）；Windows 同时提供 MSI / NSIS 安装包  ☛[前往 Releases 下载](https://github.com/OP404OP/quarkdownloaderpro/releases)
 
 </div>
 
@@ -130,6 +130,8 @@ npm run tauri:build
 > 各脚本中的 `-t <target-triple>` 是 Tauri CLI 自身的 `--target` 参数（不要写成 `-- --target`，那样会被当成传给 cargo runner 的参数）。
 
 > 交叉编译需先安装对应 target：`rustup target add <target-triple>`
+
+> **Windows 产物必须带 `WebView2Loader.dll`**：本项目的 Windows 构建使用 `x86_64-pc-windows-gnu`（GNU）工具链，Tauri 的 WebView2 绑定在 GNU 下是**动态链接**（只有 MSVC 工具链才会静态链接进 exe），因此 `quark-downloader-pro.exe` 必须与 `WebView2Loader.dll` 放在同一目录才能启动 —— 单独把 exe 拷到别处会一闪而过（缺 DLL，退出码 `0xC0000135`）。MSI / NSIS 安装包与免安装 ZIP 都已包含该 DLL，配置见 `src-tauri/tauri.windows.conf.json`。
 
 #### 产物路径
 

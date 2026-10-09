@@ -128,6 +128,57 @@
 
 **仍未处理（有意为之，均为低危或需要你决策）**：安装包签名/公证、前端单 chunk 593 KB 拆包、macOS 图标集（`icon.png` 可由打包器合成 icns）、`tauri-plugin-log` 持久化日志、`target="_blank"` 外链点击无效（需引入 opener 插件）、`is_trusted_origin` 允许任意 localhost 端口（Tauri 内部仍将非 app/dev 来源判为 Remote，不可达 IPC）、合并过程本身不可中断。
 
+### I. 安装包缺失 WebView2Loader.dll：NSIS 安装后无法启动（已修复）
+
+**症状**：MSI / NSIS 安装完成后（或解压免安装版后）双击图标/exe，窗口一闪而过或毫无反应；进程退出码 `0xC0000135`（`STATUS_DLL_NOT_FOUND`）。
+
+**根因**：本项目 Windows 侧用 **GNU** 工具链（`x86_64-pc-windows-gnu`）构建，而 `webview2-com-sys` 只在 **MSVC** 下把 WebView2 加载器静态链接进去：
+
+```rust
+target_env = "msvc"       => link(name = "WebView2LoaderStatic", kind = "static")
+not(target_env = "msvc")  => link(name = "WebView2Loader.dll")   // 运行时需要同目录的 DLL
+```
+
+所以 GNU 构建出的 exe **运行时依赖同目录的 `WebView2Loader.dll`**。而 tauri-bundler 只在下面这个条件成立时才自动把 DLL 塞进 NSIS 安装包：
+
+```rust
+// crates/tauri-bundler/src/bundle/windows/nsis/mod.rs :: generate_resource_data
+if settings.target().ends_with("-gnu") { resources.insert(loader_path, ...) }
+```
+
+`npm run tauri:build` 不带 `--target` 时 `settings.target()` 为空，条件不成立 —— **NSIS 安装包里只有 exe，没有 DLL**（MSI 走另一条分支恰好带上了，免安装 ZIP 由 CLI 另一处生成也带上了）。三个产物里只有 NSIS 因此失效。
+
+**修复**：新增 `src-tauri/tauri.windows.conf.json`（Tauri 在 Windows 构建时会自动查找并合并该文件），把 DLL 显式声明为打包资源：
+
+```json
+{ "bundle": { "resources": { "webview2/WebView2Loader.dll": "WebView2Loader.dll" } } }
+```
+
+DLL 随仓库放在 `src-tauri/webview2/`（取自 `webview2-com-sys` 的 x64 目录）。这样无论是否传 `--target`、由谁来构建，MSI / NSIS 都会带上它，不再依赖 bundler 那个 `-gnu` 判断；放在 Windows 专属配置里，macOS 的 .app/.dmg 不会被塞进一个 Windows DLL。
+
+**验证**（本机 GNU 工具链，全量 `npm run tauri:build` 后逐一实测）：
+
+| 产物 | 内容 | 实测结果 |
+|---|---|---|
+| NSIS `*-setup.exe` | exe + `WebView2Loader.dll` + uninstall.exe | 静默安装 exit 0；安装目录含 DLL；启动后进程持续存活（修复前为 `0xC0000135`） |
+| MSI | exe + `WebView2Loader.dll` | `msiexec /a` 解包确认含 DLL；直接运行包内 exe 正常存活 |
+| 免安装 ZIP | exe + `WebView2Loader.dll` + README | 解压后双击 exe 正常存活 |
+
+> 说明：安装包内的 exe 与 `target/release` 下的 exe 有 3 字节差异，是 tauri-bundler 就地把 `__TAURI_BUNDLE_TYPE_VAR_UNK` 改写成 `__TAURI_BUNDLE_TYPE_VAR_NSS`（记录打包类型）所致，属预期行为。
+
+> 另：若有人显式用 `-t x86_64-pc-windows-gnu` 构建，bundler 的 `-gnu` 分支会再自动加一次同名资源，NSIS 包里会出现两条 `File /oname=WebView2Loader.dll`（内容相同，安装包约多 70 KB），MSI 会自动去重；按 README 的 `npm run tauri:build`（不带 `--target`）构建不会重复。
+
+### J. 清理冗余文件与代码（已实施）
+
+- 删除 4 个 `debug.log`（仓库根、`src-tauri/`、`target/release/`、`target/release/bundle/nsis/`）：搜狗输入法写出的日志，与项目无关（`*.log` 已忽略，从未入库）。
+- `frontend/package.json`：移除两个**从未被 import** 的依赖 `@radix-ui/react-label`、`@radix-ui/react-separator`（`package-lock.json` 同步收缩 4 个包）。删掉后 `vite build` 的产物文件名与哈希完全不变（`index-DuagzbZF.css` / `index-CzE2w4uf.js`），可确认是死依赖而非漏用。
+- `src-tauri/capabilities/default.json`：移除冗余授权 `core:window:allow-is-maximized` —— 已被 `core:default` → `core:window:default` 覆盖（依据 `gen/schemas/acl-manifests.json`）。其余 4 条 window 授权经核对**不在**默认集内，保留。
+- `.gitignore`：删除两条重复规则（`frontend/node_modules/`、`frontend/dist/`，分别被 `node_modules/`、`dist/` 覆盖），用 `git check-ignore -v` 逐条确认忽略行为不变。
+
+清理后重跑 `npm run tauri:build`（前端 `lint` exit 0、`build` exit 0、`cargo check --all-targets` exit 0），MSI / NSIS / 免安装 ZIP 三个产物实测均能正常启动。
+
+> **未清理（等你决定）**：`unused-assets/fonts/SourceHanSansSC-VF.otf.woff2`（14.2 MB）。它未被任何代码引用、从未入库（删了无法从 git 恢复），但 README 的结构表与 `.gitignore` 都按「本地保留但不参与打包」记录，所以没有擅自删除。
+
 ### 本次验证（命令与结果）
 | 检查 | 结果 |
 |---|---|
