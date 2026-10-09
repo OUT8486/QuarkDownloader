@@ -338,6 +338,11 @@ async fn follow_redirects(
                     let next_host = url::Url::parse(&next_url)
                         .ok()
                         .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+                    // 跳转目标同样要过一遍校验：初始 URL 合法不代表上游给的
+                    // Location 合法（不能把请求带向 127.0.0.1 / 169.254.x 等本地地址）
+                    if let Err(e) = validate_download_url(&next_url) {
+                        return Err(format!("重定向目标被拒绝: {} ({})", e, next_url));
+                    }
                     if next_host != current_host && !current_cookie.is_empty() {
                         println!(
                             "[download] 跳转到不同主机 {:?}，已剥离 Cookie",
@@ -542,8 +547,12 @@ async fn download_file(
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
+    // 先固化 epoch：若在本函数开始后发生了"取消全部"（epoch 递增），
+    // 这次下载必须被判为已取消，而不是拿到递增后的新值继续下完
+    let epoch = DOWNLOAD_EPOCH.load(Ordering::SeqCst);
+
     // 排队阶段（还没调到 download_file）就被取消的任务：直接失败，不要白干活
-    if task_cancelled(&download_id) {
+    if task_cancelled(&download_id) || is_cancelled(epoch) {
         clear_task(&download_id);
         return Err("下载已取消".into());
     }
@@ -552,20 +561,33 @@ async fn download_file(
         map.entry(download_id.clone()).or_default();
     });
 
-    // 入参校验：只接受合法的远端直链与"纯文件名"
-    validate_download_url(&url)?;
-    let filename = sanitize_filename(&filename)?;
+    // 入参校验：只接受合法的远端直链与"纯文件名"。
+    // 这些早退分支也要清掉刚登记的条目，否则状态表会随失败次数泄漏
+    if let Err(e) = validate_download_url(&url) {
+        clear_task(&download_id);
+        return Err(e);
+    }
+    let filename = match sanitize_filename(&filename) {
+        Ok(name) => name,
+        Err(e) => {
+            clear_task(&download_id);
+            return Err(e);
+        }
+    };
 
     // 下载目录：优先用"软件设置"里配置的目录，否则系统默认下载目录
     let downloads_dir = resolve_download_dir(&app);
     // 原子预留输出路径：并发下载同名文件时不会选中同一个目标
-    let save_path = reserve_save_path(&downloads_dir, &filename)?;
+    let save_path = match reserve_save_path(&downloads_dir, &filename) {
+        Ok(path) => path,
+        Err(e) => {
+            clear_task(&download_id);
+            return Err(e);
+        }
+    };
     let save_path_display = save_path.to_string_lossy().to_string();
     let cleanup_path = save_path.clone();
     let cleanup_id = download_id.clone();
-
-    // 捕获当前 epoch——本次下载的"身份证"
-    let epoch = DOWNLOAD_EPOCH.load(Ordering::SeqCst);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
 
@@ -845,8 +867,10 @@ async fn download_multithread(
         ));
     }
 
-    // 10. 合并结束后再检查一次取消（大文件合并期间可能已经被取消）
-    if is_cancelled(epoch) {
+    // 10. 合并结束后再检查一次取消（大文件合并期间可能已经被取消）。
+    // 这里必须同时看全局代际与"单任务取消"标志：合并阶段没有暂停闸门，
+    // 单任务取消若只看全局标志就会被忽略，导致用户点了取消却下完并报成功。
+    if is_cancelled(epoch) || task_cancelled(&download_id) {
         let _ = tokio::fs::remove_file(&save_path).await;
         return Err("下载已取消".into());
     }
@@ -1132,6 +1156,12 @@ async fn download_single_once(
         ));
     }
 
+    // 单线程路径同样要在收尾复查取消：循环内的闸门只在每个 chunk 之间生效，
+    // 少了这一步，最后一刻的取消会被吞掉、文件照旧算成功
+    if is_cancelled(epoch) || task_cancelled(download_id) {
+        return Err("下载已取消".into());
+    }
+
     println!(
         "[download] 单线程完成: {} ({:.1} MB, {} bytes)",
         filename,
@@ -1146,7 +1176,6 @@ async fn download_single_once(
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_os::init())
         // 目录选择对话框（"软件设置"里选下载目录用）
         .plugin(tauri_plugin_dialog::init())
@@ -1186,7 +1215,11 @@ fn main() {
                     return false;
                 }
 
-                // 允许的导航=页面重载/切换：旧页面已收不到进度事件，主动取消在跑的下载
+                // 允许的导航=页面重载/切换：旧页面已收不到进度事件，主动取消在跑的下载。
+                // 这里同时清掉暂停与单任务标记，保证"刷新 == 取消"这一语义在
+                // 后端也成立（否则刷新后新页面若不再发一次 resume，任务会永久挂起）。
+                DOWNLOAD_PAUSED.store(false, Ordering::SeqCst);
+                clear_all_tasks();
                 let old = DOWNLOAD_EPOCH.fetch_add(1, Ordering::SeqCst);
                 println!(
                     "[download] 检测到页面导航/刷新，取消下载 (epoch {} → {})",
@@ -1217,13 +1250,27 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 let router = api_server::create_router();
-                let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-                    .await
-                    .expect("failed to bind API server port");
-                println!("[quark-api] 内嵌服务已启动: http://127.0.0.1:{}", port);
-                axum::serve(listener, router)
-                    .await
-                    .expect("API server error");
+                let addr = format!("127.0.0.1:{}", port);
+
+                // 端口被占用时绝不能 panic：那样窗口照常打开，但所有接口都失效，
+                // 用户只会看到"网络错误"。这里改为打印一条醒目的错误并让应用继续跑。
+                let listener = match tokio::net::TcpListener::bind(&addr).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        eprintln!(
+                            "[quark-api] 启动失败: 无法监听 {} —— {}。\
+                             该端口可能被其它程序（或本应用的另一个实例）占用；\
+                             请关闭占用方后重启本应用，否则界面上的所有操作都会失败。",
+                            addr, e
+                        );
+                        return;
+                    }
+                };
+
+                println!("[quark-api] 内嵌服务已启动: http://{}", addr);
+                if let Err(e) = axum::serve(listener, router).await {
+                    eprintln!("[quark-api] 内嵌服务异常退出: {}", e);
+                }
             });
 
             Ok(())

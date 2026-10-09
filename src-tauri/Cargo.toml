@@ -15,7 +15,6 @@ tauri-build = { version = "2", features = [] }
 # `download_file`（参数含 url 与 filename），配合任意导航即构成任意文件写入。
 # 升级后请执行一次 `cargo build`（或 `cargo update -p tauri`）刷新 Cargo.lock。
 tauri = { version = "2.11.1", features = [] }
-tauri-plugin-shell = "2"
 tauri-plugin-os = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

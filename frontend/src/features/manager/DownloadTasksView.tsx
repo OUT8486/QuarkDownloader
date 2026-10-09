@@ -246,7 +246,7 @@ const TaskRow: React.FC<TaskRowProps> = ({ task, onRemove }) => {
 };
 
 export const DownloadTasksView: React.FC = () => {
-    const { downloadTasks, removeTask, clearFinishedTasks, notify } = useQuarkStore();
+    const { downloadTasks, removeTask, clearFinishedTasks, notify, batchPaused } = useQuarkStore();
 
     const counts = countByStatus(downloadTasks);
     const finishedCount = counts.done + counts.failed + counts.cancelled;
@@ -267,8 +267,9 @@ export const DownloadTasksView: React.FC = () => {
     };
 
     const handleResumeAll = async () => {
+        // 没有全局暂停时「全部继续」会逐个恢复被单独暂停的任务，所以这里说的是任务而不是批次
         if (!(await resumeAllTasks())) {
-            notify('当前没有暂停中的批次', 'warn');
+            notify('当前没有暂停中的任务', 'warn');
         }
     };
 
@@ -303,6 +304,7 @@ export const DownloadTasksView: React.FC = () => {
                         variant="outline"
                         onClick={() => void handlePauseAll()}
                         disabled={counts.active === 0}
+                        title={batchPaused ? '批次已暂停' : '暂停全部任务'}
                         className="h-9 rounded-xl font-bold text-amber-600 border-amber-100 hover:bg-amber-50 hover:text-amber-700"
                     >
                         <Pause size={14} />
@@ -313,6 +315,7 @@ export const DownloadTasksView: React.FC = () => {
                         variant="outline"
                         onClick={() => void handleResumeAll()}
                         disabled={counts.paused === 0}
+                        title={batchPaused ? '恢复整个批次' : '继续所有已暂停的任务'}
                         className="h-9 rounded-xl font-bold text-emerald-600 border-emerald-100 hover:bg-emerald-50 hover:text-emerald-700"
                     >
                         <Play size={14} />

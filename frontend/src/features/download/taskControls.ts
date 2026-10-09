@@ -8,15 +8,17 @@ type PipelinePhase = 'transferring' | 'preparing' | 'downloading';
 // —— 批次级共享状态 ——
 // 下载面板（DownloadManager）随时可能被卸载或被重新挂载，但批次必须继续跑，
 // 因此调度状态、暂停闸门与批次标记全部放在模块作用域，而不是组件内部。
+// 全局暂停标志（paused）放在 store 的 batchPaused 上：解析页与下载管理页必须读同一份状态，
+// 否则一个视图暂停后另一个视图还显示「暂停」，点下去反而什么都不做。
 export const batchState = {
     running: false,          // 是否有批次在执行（含「只剩暂停任务」的等待态）
     cancelRequested: false,  // 批次级取消（取消全部）
-    paused: false,           // 全局暂停（后端 pause_downloads 生效中）
 };
 
 const runningIds = new Set<string>();    // 正在占用并发额度的任务
 const parkedIds = new Set<string>();     // 已被暂停的任务（不占并发额度）
 const inflightIds = new Set<string>();   // download_file 已发出、等待后端返回的任务
+const pipelineIds = new Set<string>();   // 真正有流水线在跑的任务（用于识别幽灵并发额度）
 const cancelledIds = new Set<string>();  // 被逐个取消的任务
 const pauseGates = new Map<string, () => void>();
 
@@ -24,6 +26,17 @@ let pendingIds: string[] = [];           // 尚未派发的任务 id（保持批
 let launcher: ((id: string) => void) | null = null;
 let maxConcurrent = 1;
 let wakeDrain: (() => void) | null = null;
+
+// 全局暂停标志：唯一真值在 store 里（两个视图都按它渲染按钮）
+export const isBatchPaused = () => useQuarkStore.getState().batchPaused;
+const setBatchPaused = (paused: boolean) => useQuarkStore.getState().setBatchPaused(paused);
+
+// 取一个「还没结束」的任务：任务已被移除或已结束时，它不可能再有流水线在跑
+const findLiveTask = (id: string) => {
+    const task = useQuarkStore.getState().downloadTasks.find((item) => item.id === id);
+    if (!task || isTaskFinished(task.status)) return null;
+    return task;
+};
 
 // 只剩暂停中的任务时，批次不空转：等一次派发 / 取消事件再继续检查
 export const waitBatchActivity = () => new Promise<void>((resolve) => {
@@ -74,6 +87,17 @@ const releaseAllPauseGates = () => {
     pauseGates.clear();
 };
 
+// 丢弃一个任务的全部前端调度痕迹（并发额度、暂停闸门、在途标记、取消标记）。
+// 只对「已经不可能再有流水线」的任务调用，否则会让还没结束的任务失去记账
+const forgetTask = (id: string) => {
+    runningIds.delete(id);
+    pipelineIds.delete(id);
+    parkedIds.delete(id);
+    inflightIds.delete(id);
+    cancelledIds.delete(id);
+    releasePauseGate(id);
+};
+
 // 派发下一个可执行任务：暂停中的任务留在队列里，但不会被派发
 export const dispatchNext = () => {
     if (!launcher) return;
@@ -86,6 +110,7 @@ export const dispatchNext = () => {
         runningIds.add(id);
         try {
             launcher(id);
+            pipelineIds.add(id);
         } catch (error: unknown) {
             // 启动失败不能吞掉并发额度，否则队列会被永久堵死
             runningIds.delete(id);
@@ -107,11 +132,13 @@ export const beginBatch = (taskIds: string[], options: { launch: (id: string) =>
     runningIds.clear();
     parkedIds.clear();
     inflightIds.clear();
+    pipelineIds.clear();
     cancelledIds.clear();
     releaseAllPauseGates();
 
     batchState.running = true;
     batchState.cancelRequested = false;
+    setBatchPaused(false);
     dispatchNext();
 };
 
@@ -123,24 +150,31 @@ export const endBatch = () => {
     runningIds.clear();
     parkedIds.clear();
     inflightIds.clear();
+    pipelineIds.clear();
     cancelledIds.clear();
     releaseAllPauseGates();
     notifyBatchActivity();
 };
 
-// 单个任务结束（成功/失败/取消）：释放并发额度并派发下一个
+// 单个任务结束（成功/失败/取消）：释放并发额度并派发下一个。
+// 必须同时清掉 parkedIds 与该任务的闸门：任务可能在「已暂停」期间自己结束
+// （例如转存轮询超时），残留的 id 会被「全部继续」重新激活成一个没有流水线的幽灵任务
 export const finishTask = (id: string) => {
     runningIds.delete(id);
+    pipelineIds.delete(id);
     inflightIds.delete(id);
+    parkedIds.delete(id);
+    cancelledIds.delete(id);
+    releasePauseGate(id);
     dispatchNext();
 };
 
 // 暂停单个任务：后端在 chunk 之间挂起（连接与分片都保留），
 // 还没进入下载阶段的任务由前端闸门挡住，不会偷偷开始下载
 export const pauseTask = async (id: string): Promise<boolean> => {
-    const { downloadTasks, updateTask, addLog } = useQuarkStore.getState();
-    const task = downloadTasks.find((item) => item.id === id);
-    if (!task || task.status === 'paused' || isTaskFinished(task.status)) return false;
+    const { updateTask, addLog } = useQuarkStore.getState();
+    const task = findLiveTask(id);
+    if (!task || task.status === 'paused') return false;
 
     // 只有已经发出 download_file 的任务后端才认识，其余阶段无需（也不能）调用 pause_task
     if (inflightIds.has(id)) {
@@ -149,6 +183,13 @@ export const pauseTask = async (id: string): Promise<boolean> => {
         } catch (error: unknown) {
             // 后端没接受暂停就保持原状态，避免前后端不一致
             addLog(`暂停失败: ${getErrorMessage(error)}`, 'error');
+            return false;
+        }
+
+        // IPC 往返期间任务可能已经结束：结束的任务不能再被写成「已暂停」，
+        // 否则 parkedIds 会留下永远等不到恢复的幽灵 id，把批次卡死
+        if (!findLiveTask(id)) {
+            forgetTask(id);
             return false;
         }
     }
@@ -164,12 +205,12 @@ export const pauseTask = async (id: string): Promise<boolean> => {
 
 // 继续单个任务：在下载阶段先恢复后端任务，再放行前端闸门
 export const resumeTask = async (id: string): Promise<boolean> => {
-    const { downloadTasks, updateTask, addLog } = useQuarkStore.getState();
-    const task = downloadTasks.find((item) => item.id === id);
+    const { updateTask, addLog } = useQuarkStore.getState();
+    const task = findLiveTask(id);
     if (!task || task.status !== 'paused') return false;
 
     // 全局暂停期间单独继续一个任务没有意义：后端全局标志会让它立刻再次挂起
-    if (batchState.paused) {
+    if (isBatchPaused()) {
         addLog('全局暂停中，已改为恢复全部下载', 'warn');
         return resumeAllTasks();
     }
@@ -181,6 +222,12 @@ export const resumeTask = async (id: string): Promise<boolean> => {
         } catch (error: unknown) {
             // 后端没恢复成功就保持暂停态，闸门也不放开
             addLog(`恢复失败: ${getErrorMessage(error)}`, 'error');
+            return false;
+        }
+
+        // IPC 往返期间任务可能已经结束：再把它算成「在跑」会永久占用一个并发额度
+        if (!findLiveTask(id)) {
+            forgetTask(id);
             return false;
         }
     }
@@ -198,9 +245,9 @@ export const resumeTask = async (id: string): Promise<boolean> => {
 
 // 取消单个任务：只影响这一个任务，其他任务与队列继续跑
 export const cancelTask = async (id: string): Promise<boolean> => {
-    const { downloadTasks, updateTask, addLog } = useQuarkStore.getState();
-    const task = downloadTasks.find((item) => item.id === id);
-    if (!task || isTaskFinished(task.status)) return false;
+    const { updateTask, addLog } = useQuarkStore.getState();
+    const task = findLiveTask(id);
+    if (!task) return false;
 
     const inflight = inflightIds.has(id);
     const wasRunning = runningIds.delete(id);
@@ -212,22 +259,27 @@ export const cancelTask = async (id: string): Promise<boolean> => {
     pendingIds = pendingIds.filter((item) => item !== id);
 
     if (!inflight) {
-        // 还没交给后端（排队 / 转存 / 准备阶段）：后端不认识这个 taskId，本地立即收尾
+        // 还没交给后端（排队 / 转存 / 准备阶段）：后端不认识这个 taskId，
+        // 既不能调用 cancel_task（会为永远不会进入 download_file 的任务留下状态条目），
+        // 也不需要回滚：本地直接收尾，流水线会在下一个检查点退出并调用 finishTask。
+        // 注意这里已经让出了并发额度，但额度由该任务自己的 finishTask 兜底，不会泄漏。
         updateTask(id, { status: 'cancelled', speed: 0, finishedAt: Date.now() });
+        addLog(`已取消: ${task.filename}`, 'info');
+        dispatchNext();
+        notifyBatchActivity();
+        return true;
     }
 
     try {
         await invoke('cancel_task', { taskId: id });
     } catch (error: unknown) {
-        if (inflight) {
-            // 后端没取消成功：撤销本地取消意图，任务继续下载，否则界面会与后端不一致
-            cancelledIds.delete(id);
-            if (wasRunning) runningIds.add(id);
-            addLog(`取消失败: ${getErrorMessage(error)}`, 'error');
-            dispatchNext();
-            return false;
-        }
-        // 排队/转存阶段的任务后端可能还不认识；本地已经标记取消，无需打扰用户
+        // 后端没取消成功：撤销本地取消意图，任务继续下载，否则界面会与后端不一致。
+        // 并发额度必须原样还回去（无论处于哪个阶段），否则这个任务会永久占不到名额
+        cancelledIds.delete(id);
+        if (wasRunning) runningIds.add(id);
+        addLog(`取消失败: ${getErrorMessage(error)}`, 'error');
+        dispatchNext();
+        return false;
     }
 
     addLog(`已取消: ${task.filename}`, 'info');
@@ -247,14 +299,28 @@ const parkAllTasks = () => {
     }
 };
 
-// 恢复全部被 park 的任务：在下载阶段的后端任务由 resume_downloads 统一恢复
+// 恢复全部被 park 的任务：后端全局标志由 resume_downloads 恢复，
+// 单任务标志必须逐个用 resume_task 清掉（Rust 的 wait_if_paused 要求两个标志同时为假）
 const unparkAllTasks = () => {
-    const { downloadTasks, updateTask } = useQuarkStore.getState();
+    const { downloadTasks, updateTask, addLog } = useQuarkStore.getState();
     for (const task of downloadTasks) {
         if (!parkedIds.has(task.id)) continue;
 
+        // 防御性收尾：暂停期间自己结束的任务（例如转存轮询超时、小文件抢在暂停前完成）
+        // 不能被「复活」成没有流水线的幽灵任务，否则并发记账永远清不空
+        if (isTaskFinished(task.status)) {
+            forgetTask(task.id);
+            continue;
+        }
+
         const inflight = inflightIds.has(task.id);
         const stillQueued = pendingIds.includes(task.id);
+        // 单任务暂停的任务只有 inflight 的那部分后端才认识；resume_task 失败不影响全局恢复
+        if (inflight) {
+            void invoke('resume_task', { taskId: task.id }).catch((error: unknown) => {
+                addLog(`恢复任务失败: ${getErrorMessage(error)}`, 'warn');
+            });
+        }
         releasePauseGate(task.id);
         parkedIds.delete(task.id);
         if (!stillQueued) runningIds.add(task.id);
@@ -266,7 +332,7 @@ const unparkAllTasks = () => {
 // 全部暂停：后端在所有任务的 chunk 之间挂起，前端把所有任务 park
 export const pauseAllTasks = async (): Promise<boolean> => {
     const { addLog } = useQuarkStore.getState();
-    if (!batchState.running || batchState.paused) return false;
+    if (!batchState.running || isBatchPaused()) return false;
 
     try {
         await invoke('pause_downloads');
@@ -275,16 +341,32 @@ export const pauseAllTasks = async (): Promise<boolean> => {
         return false;
     }
 
-    batchState.paused = true;
+    setBatchPaused(true);
     parkAllTasks();
     addLog('已暂停下载（进度与临时分片保留，可随时继续）', 'warn');
     return true;
 };
 
-// 全部继续：先让后端恢复，再放行前端闸门，避免恢复瞬间又被全局标志挂住
+// 全部继续：有全局暂停时先让后端恢复，再放行前端闸门，避免恢复瞬间又被全局标志挂住；
+// 没有全局暂停时退化为「继续所有被单独暂停的行」，与下载管理页按钮的可用条件保持一致
 export const resumeAllTasks = async (): Promise<boolean> => {
     const { addLog } = useQuarkStore.getState();
-    if (!batchState.paused) return false;
+
+    if (!isBatchPaused()) {
+        const pausedIds = useQuarkStore.getState().downloadTasks
+            .filter((task) => task.status === 'paused')
+            .map((task) => task.id);
+        if (pausedIds.length === 0) return false;
+
+        let resumed = 0;
+        for (const id of pausedIds) {
+            if (await resumeTask(id)) resumed += 1;
+        }
+        if (resumed < pausedIds.length) {
+            addLog(`有 ${pausedIds.length - resumed} 个任务未能继续`, 'warn');
+        }
+        return resumed > 0;
+    }
 
     try {
         await invoke('resume_downloads');
@@ -293,7 +375,7 @@ export const resumeAllTasks = async (): Promise<boolean> => {
         return false;
     }
 
-    batchState.paused = false;
+    setBatchPaused(false);
     unparkAllTasks();
     addLog('已恢复下载', 'info');
     return true;
@@ -310,20 +392,33 @@ const abandonPendingTasks = () => {
         updateTask(id, { status: 'cancelled', speed: 0, finishedAt: Date.now() });
     }
 
+    // 防御性收尾：没有流水线的并发额度一定是幽灵（例如旧版本「全部继续」复活过的已结束任务），
+    // 留着会让 hasPendingWork() 永远为真，批次卡在等待里无法收尾
+    for (const id of [...runningIds]) {
+        if (pipelineIds.has(id)) continue;
+        forgetTask(id);
+    }
+
     parkedIds.clear();
     releaseAllPauseGates();
     notifyBatchActivity();
+};
+
+// 批次级取消意图（不含后端调用）：把标记与队列收尾绑在一起，
+// 保证 cancelRequested 一旦为真，队列里就不会留下永远等不到派发的任务
+export const requestBatchCancel = () => {
+    batchState.cancelRequested = true;
+    abandonPendingTasks();
 };
 
 // 取消全部：批次标记 + 清空待派发队列 + 放行所有闸门，
 // 已经在下载的任务由后端 cancel_downloads 结束（各自的 download_file 会以「已取消」拒绝）
 export const cancelAllTasks = async (): Promise<void> => {
     const { addLog, setDownloading } = useQuarkStore.getState();
-    batchState.cancelRequested = true;
-    // 取消会结束任务：后端也会清掉全局暂停标志，前端同步复位
-    batchState.paused = false;
+    // 取消会结束任务：后端也会清掉暂停标志，前端同步复位
+    setBatchPaused(false);
     addLog('已请求取消全部下载...', 'warn');
-    abandonPendingTasks();
+    requestBatchCancel();
 
     try {
         await invoke('cancel_downloads');

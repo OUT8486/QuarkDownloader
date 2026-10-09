@@ -175,6 +175,8 @@ interface QuarkState {
     shareInfo: ShareParseState;
     logs: LogEntry[];
     downloading: boolean;
+    // 批次级「全部暂停」状态：解析页的工具栏与下载管理页都读这一份，避免两个视图各说各话
+    batchPaused: boolean;
     progress: {
         done: number;
         total: number;
@@ -202,6 +204,7 @@ interface QuarkState {
     selectAllFiles: (fids: string[]) => void;
     clearSelection: () => void;
     setDownloading: (downloading: boolean) => void;
+    setBatchPaused: (paused: boolean) => void;
     setProgress: (done: number, total: number, text: string) => void;
     createTasks: (files: { fid: string; file_name: string; size: number }[]) => DownloadTask[];
     updateTask: (id: string, patch: Partial<DownloadTask>) => void;
@@ -244,6 +247,7 @@ export const useQuarkStore = create<QuarkState>((set) => ({
     },
     logs: [],
     downloading: false,
+    batchPaused: false,
     progress: {
         done: 0,
         total: 0,
@@ -334,6 +338,8 @@ export const useQuarkStore = create<QuarkState>((set) => ({
     selectAllFiles: (fids: string[]) => set({ selectedFids: new Set(fids) }),
     clearSelection: () => set({ selectedFids: new Set<string>() }),
     setDownloading: (downloading: boolean) => set({ downloading }),
+    // 只改标志位：真正的暂停/恢复动作由 taskControls 统一编排（后端闸门 + 前端闸门）
+    setBatchPaused: (paused: boolean) => set({ batchPaused: paused }),
     setProgress: (done: number, total: number, text: string) => set({ progress: { done, total, text } }),
     createTasks: (files: { fid: string; file_name: string; size: number }[]) => {
         const batchSize = files.length;
@@ -350,9 +356,11 @@ export const useQuarkStore = create<QuarkState>((set) => ({
             batchSize,
         }));
 
-        // 按 queueIndex 升序排列：Array.sort 稳定，同序号的不同批次保持创建先后
+        // 直接追加，不做全局排序：queueIndex 只在批次内有意义，
+        // 按它整体排序会把新批次的 [1/5] 插到上一批的 [1/5] 与 [2/5] 之间。
+        // 保持创建顺序即可满足「旧批次在前、新批次在后，批次内按 queueIndex」。
         set((state: QuarkState) => ({
-            downloadTasks: [...state.downloadTasks, ...created].sort((a, b) => a.queueIndex - b.queueIndex),
+            downloadTasks: [...state.downloadTasks, ...created],
         }));
         return created;
     },

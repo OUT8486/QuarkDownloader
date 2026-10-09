@@ -104,9 +104,11 @@ export const quarkApi = {
         return data;
     },
 
-    getMemberInfo: async () => {
+    // cookie 可选：登录时用"待验证的 Cookie"发起校验，验证通过前不写入本地存储
+    getMemberInfo: async (cookie?: string) => {
         const { data } = await http.get<QuarkResponse<CapacityData>>('/member', {
             params: { fetch_subscribe: true, _ch: 'home', fetch_identity: true },
+            headers: cookie ? { 'x-cookie': cookie } : undefined,
         });
         return data;
     },

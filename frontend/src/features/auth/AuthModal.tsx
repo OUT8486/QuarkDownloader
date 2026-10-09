@@ -126,22 +126,21 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
         const trimmed = cookieInput.trim();
         if (!trimmed) return;
         setIsSaving(true);
-        // 记录当前有效 Cookie：验证失败时恢复，绝不因为一次输入错误而销毁已登录的会话
-        const previousCookie = useQuarkStore.getState().cookie;
+        // 先拿"待验证的 Cookie"去请求，验证通过后才写入本地存储：
+        // 这样验证失败或中途异常都不会破坏已有的登录状态
+        const hadPrevious = Boolean(useQuarkStore.getState().cookie);
         try {
-            setCookie(trimmed);
-            const res = await quarkApi.getMemberInfo();
+            const res = await quarkApi.getMemberInfo(trimmed);
             if (res.status === 200 || res.code === 0) {
+                setCookie(trimmed);
                 addLog('Cookie 已保存并验证通过', 'success');
                 notify('登录成功，欢迎回来', 'success');
                 handleClose();
             } else {
-                setCookie(previousCookie);
-                notify(`Cookie 无效，请检查后重新输入${previousCookie ? '（已保留原有登录状态）' : ''}`, 'error');
+                notify(`Cookie 无效，请检查后重新输入${hadPrevious ? '（原有登录状态未受影响）' : ''}`, 'error');
             }
         } catch {
-            setCookie(previousCookie);
-            notify(`Cookie 验证失败，请检查是否正确${previousCookie ? '（已保留原有登录状态）' : ''}`, 'error');
+            notify(`Cookie 验证失败，请检查是否正确${hadPrevious ? '（原有登录状态未受影响）' : ''}`, 'error');
         } finally {
             setIsSaving(false);
         }

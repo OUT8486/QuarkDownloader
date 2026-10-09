@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { CheckSquare, Square, Loader2, Zap, Ban, Play, Pause } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { useQuarkStore } from '../../store/useQuarkStore';
@@ -15,9 +15,11 @@ import {
     endBatch,
     finishTask,
     hasPendingWork,
+    isBatchPaused,
     isTaskCancelled,
     markTaskInflight,
     pauseAllTasks,
+    requestBatchCancel,
     resumeAllTasks,
     setTaskPhase,
     unsettledCount,
@@ -47,6 +49,7 @@ export const DownloadManager: React.FC = () => {
         clearSelection,
         downloading,
         setDownloading,
+        batchPaused,
         progress,
         setProgress,
         addLog,
@@ -61,9 +64,7 @@ export const DownloadManager: React.FC = () => {
         updateTask
     } = useQuarkStore();
 
-    // 面板重新挂载时从模块状态恢复暂停态，避免"后端已暂停、界面却显示可暂停"
-    const [paused, setPaused] = useState(batchState.paused);
-
+    // 批次暂停状态来自 store（taskControls 维护）：下载管理页暂停后这里的按钮同步变成「继续」
     const handleSelectAll = () => {
         if (selectedFids.size === shareInfo.allFiles.length) {
             clearSelection();
@@ -80,27 +81,23 @@ export const DownloadManager: React.FC = () => {
 
     const handleCancel = async () => {
         if (!batchState.running) return;
-        // 取消会结束任务：后端也会清掉暂停标志，前端同步复位
-        setPaused(false);
+        // 取消会结束任务：后端与前端（cancelAllTasks 内部）都会清掉暂停标志
         await cancelAllTasks();
     };
 
     const handlePause = async () => {
-        if (!batchState.running || batchState.paused) return;
+        if (!batchState.running || batchPaused) return;
         if (await pauseAllTasks()) {
-            setPaused(true);
             setProgress(progress.done, progress.total, '已暂停');
             return;
         }
-        // 后端没接受暂停就回滚界面状态，避免前后端不一致
-        setPaused(false);
+        // 后端没接受暂停就保持原样，避免前后端不一致
         setProgress(progress.done, progress.total, `正在处理 ${progress.done}/${progress.total}`);
     };
 
     const handleResume = async () => {
-        if (!batchState.paused) return;
+        if (!batchPaused) return;
         if (await resumeAllTasks()) {
-            setPaused(false);
             setProgress(progress.done, progress.total, `正在处理 ${progress.done}/${progress.total}`);
         }
     };
@@ -138,8 +135,7 @@ export const DownloadManager: React.FC = () => {
         batchState.running = true;
         batchState.cancelRequested = false;
         // 防御性复位：上一轮若在暂停状态下收尾，后端可能残留暂停标志
-        batchState.paused = false;
-        setPaused(false);
+        // （前端标志由 beginBatch 统一复位，两个视图都从 store 读）
         void invoke('resume_downloads').catch(() => {});
         setDownloading(true);
         clearLogs();
@@ -193,19 +189,47 @@ export const DownloadManager: React.FC = () => {
 
                 const transferTaskId = sr.data.task_id;
 
-                for (let r = 0; r < 20; r++) {
+                // 转存排队时间不可控：轮询 40 × 500ms ≈ 20 秒，任何时候拿到文件 ID 都继续
+                const TRANSFER_POLL_ATTEMPTS = 40;
+                // 有些响应即使 status 还没到 2 也已经带回了转存结果，先记下来做兜底清理
+                let lastSeenFid: string | null = null;
+                for (let r = 0; r < TRANSFER_POLL_ATTEMPTS; r++) {
                     await sleep(500);
                     // 取消检查点：转存阶段就被取消的任务不再继续轮询
                     if (batchState.cancelRequested || isTaskCancelled(id)) throw new Error('已取消');
 
                     const tr = await quarkApi.queryTask(transferTaskId, r);
+                    lastSeenFid = tr.data?.save_as?.save_as_top_fids?.[0] ?? lastSeenFid;
                     if (tr.data && tr.data.status === 2) {
-                        savedFid = tr.data.save_as?.save_as_top_fids?.[0] ?? null;
+                        savedFid = tr.data.save_as?.save_as_top_fids?.[0] ?? lastSeenFid;
                         break;
                     }
                 }
 
+                // 预算用尽后再补查一次（可能刚好差最后一次），并沿用响应里带回的 fid：
+                // saveFiles 已经在网盘根目录建好了文件，拿不到 fid 就没人能清理它
+                if (!savedFid && !batchState.cancelRequested && !isTaskCancelled(id)) {
+                    try {
+                        const last = await quarkApi.queryTask(transferTaskId, TRANSFER_POLL_ATTEMPTS);
+                        lastSeenFid = last.data?.save_as?.save_as_top_fids?.[0] ?? lastSeenFid;
+                        if (last.data && last.data.status === 2) {
+                            savedFid = last.data.save_as?.save_as_top_fids?.[0] ?? lastSeenFid;
+                        }
+                    } catch (e: unknown) {
+                        addLog(`  补查转存结果失败: ${getErrorMessage(e)}`, 'warn');
+                    }
+                }
+
                 if (!savedFid) {
+                    if (lastSeenFid) {
+                        // 转存没确认完成但已经拿到文件 ID：赋给 savedFid 交给 finally 兜底删除，
+                        // 否则这个已经建好的网盘文件会永久占用空间（状态未知，不能拿它去下载）
+                        savedFid = lastSeenFid;
+                        addLog('  转存未确认完成，正在清理网盘临时文件', 'warn');
+                    } else {
+                        // 连文件 ID 都没拿到：网盘根目录可能已经留下一个转存文件，必须明确告知用户
+                        addLog('转存超时：文件可能已转存到网盘根目录，请到网盘检查并手动删除', 'warn');
+                    }
                     throw new Error('转存超时或未获取到文件 ID');
                 }
 
@@ -258,11 +282,17 @@ export const DownloadManager: React.FC = () => {
                 return 'done';
             } catch (error: unknown) {
                 const message = getErrorMessage(error);
-                if (message.includes('已取消')) {
+                // 「用户取消」以本地状态为准：后端文案不能作为唯一依据，
+                // 否则任何恰好包含「已取消」的无关错误都会被误判成取消
+                const cancelledLocally = isTaskCancelled(id) || batchState.cancelRequested;
+                // 兜底：刷新/关闭页面时 App 直接调用了后端 cancel_downloads，本地来不及打标记，
+                // 这类真正的取消只能靠文案识别（放在本地判定之后，尽量缩小误判面）
+                const cancelledByBackend = message.includes('已取消');
+                if (cancelledLocally || cancelledByBackend) {
                     // 用户主动取消导致的失败：按提示信息记录，不弹错误提示
                     addLog(`  已取消: ${message}`, 'info');
-                    // 逐个取消这一个任务不影响队列；只有批次级取消才停止派发后续文件
-                    if (!isTaskCancelled(id)) batchState.cancelRequested = true;
+                    // 本地没有标记却收到取消错误 => 后端已经结束整批，同步收尾队列（逐个取消不影响队列）
+                    if (!cancelledLocally) requestBatchCancel();
                     updateTask(id, { status: 'cancelled', speed: 0, finishedAt: Date.now() });
                     return 'cancelled';
                 }
@@ -347,10 +377,12 @@ export const DownloadManager: React.FC = () => {
             endBatch();
             setDownloading(false);
             // 任务在暂停状态下收尾时（例如暂停恰好发生在转存阶段、没有在途下载），
-            // 后端会残留全局暂停标志，必须清掉，否则下一批任务一启动就挂住
-            if (batchState.paused) {
-                batchState.paused = false;
-                setPaused(false);
+            // 后端会残留全局暂停标志，必须清掉，否则下一批任务一启动就挂住。
+            // 这里必须读实时值（isBatchPaused 直接取 store）：startDownload 是长任务，
+            // 渲染期拿到的 batchPaused 快照早已过期
+            const pausedNow = isBatchPaused();
+            if (pausedNow) {
+                useQuarkStore.getState().setBatchPaused(false);
                 void invoke('resume_downloads').catch(() => {});
             }
         }
@@ -395,19 +427,19 @@ export const DownloadManager: React.FC = () => {
                     </div>
 
                     <Button
-                        onClick={paused ? handleResume : handlePause}
+                        onClick={batchPaused ? handleResume : handlePause}
                         disabled={!downloading}
-                        title={paused ? '继续全部任务' : '暂停全部任务'}
+                        title={batchPaused ? '继续全部任务' : '暂停全部任务'}
                         variant="outline"
                         className={cn(
                             "px-3 h-9 rounded-lg text-[11px] font-bold flex items-center gap-2 disabled:opacity-40",
-                            paused
+                            batchPaused
                                 ? "text-emerald-600 border-emerald-100 hover:bg-emerald-50 hover:text-emerald-700"
                                 : "text-amber-600 border-amber-100 hover:bg-amber-50 hover:text-amber-700"
                         )}
                     >
-                        {paused ? <Play size={14} /> : <Pause size={14} />}
-                        {paused ? '继续' : '暂停'}
+                        {batchPaused ? <Play size={14} /> : <Pause size={14} />}
+                        {batchPaused ? '继续' : '暂停'}
                     </Button>
 
                     <Button

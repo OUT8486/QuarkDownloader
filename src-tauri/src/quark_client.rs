@@ -319,11 +319,9 @@ pub async fn qr_get_cookie(st: &str) -> Result<Value, String> {
 
     let result = fetch_with_cookies(&url, vec![]).await?;
     let mut all_raw = result.cookies;
-    let mut cookie_str = all_raw.iter()
-        .filter_map(|c| c.split(';').next())
-        .map(|s| s.trim().to_string())
-        .collect::<Vec<_>>()
-        .join("; ");
+    // 用统一的拼接函数去重（同名 Cookie 后者覆盖前者），避免登录结果里同时存在
+    // 重复/过期的 __puus、__uid —— 直接 join 会让上游收到两份同名 Cookie
+    let mut cookie_str = build_cookie_header(&all_raw);
 
     println!("[qrlogin/cookie] Step1 Cookie 字段: {}", extract_cookie_keys(&cookie_str));
 
@@ -341,11 +339,7 @@ pub async fn qr_get_cookie(st: &str) -> Result<Value, String> {
             Ok(r) => {
                 if r.cookies.len() > all_raw.len() {
                     all_raw = r.cookies;
-                    cookie_str = all_raw.iter()
-                        .filter_map(|c| c.split(';').next())
-                        .map(|s| s.trim().to_string())
-                        .collect::<Vec<_>>()
-                        .join("; ");
+                    cookie_str = build_cookie_header(&all_raw);
                     println!("[qrlogin/cookie] {} 新增 Cookie, 总字段: {}", step, extract_cookie_keys(&cookie_str));
                 } else {
                     println!("[qrlogin/cookie] {} 未获取到新 Cookie", step);

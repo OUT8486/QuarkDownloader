@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 pub const SETTINGS_FILE: &str = "settings.json";
 
-/// 写权限探针文件名（校验完立即删除）
-const WRITE_PROBE: &str = ".quark_write_probe";
+/// 写权限探针文件名前缀（校验完立即删除；名字带唯一后缀，避免与用户文件撞名）
+const WRITE_PROBE_PREFIX: &str = ".quark_write_probe_";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -29,12 +29,22 @@ pub fn read_settings(config_dir: &Path) -> Settings {
     }
 }
 
-/// 写入设置（配置目录会自动创建）
+/// 写入设置（配置目录会自动创建）。
+/// 采用"写临时文件 + 原子替换"：避免截断写入期间被并发读到半截内容，
+/// 那样 read_settings 会回退默认值，导致下载目录悄悄变回系统默认目录。
 pub fn write_settings(config_dir: &Path, settings: &Settings) -> Result<(), String> {
     std::fs::create_dir_all(config_dir).map_err(|e| format!("创建配置目录失败: {}", e))?;
     let text =
         serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {}", e))?;
-    std::fs::write(config_dir.join(SETTINGS_FILE), text).map_err(|e| format!("写入设置失败: {}", e))
+
+    let target = config_dir.join(SETTINGS_FILE);
+    let temp = config_dir.join(format!("{}.tmp", SETTINGS_FILE));
+    std::fs::write(&temp, text).map_err(|e| format!("写入设置失败: {}", e))?;
+    // 同一目录内 rename 在 Windows 上是原子替换
+    std::fs::rename(&temp, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("保存设置失败: {}", e)
+    })
 }
 
 /// 校验并规范化下载目录：
@@ -56,8 +66,17 @@ pub fn validate_download_dir(path: &str) -> Result<PathBuf, String> {
 
     std::fs::create_dir_all(&candidate).map_err(|e| format!("无法创建目录: {}", e))?;
 
-    let probe = candidate.join(WRITE_PROBE);
-    std::fs::write(&probe, b"ok").map_err(|e| format!("目录不可写: {}", e))?;
+    // 唯一文件名 + create_new：既不覆盖用户目录里恰好同名的文件，
+    // 也不会被上次异常退出残留的探针影响判定
+    let probe = candidate.join(format!("{}{}", WRITE_PROBE_PREFIX, uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|e| format!("目录不可写: {}", e))?;
+    use std::io::Write;
+    file.write_all(b"ok").map_err(|e| format!("目录不可写: {}", e))?;
+    drop(file);
     let _ = std::fs::remove_file(&probe);
 
     Ok(candidate)
@@ -104,7 +123,17 @@ mod tests {
         // 合法目录：通过，且探针文件已清理
         let ok = validate_download_dir(&dir_str).expect("合法目录应通过");
         assert_eq!(ok, dir);
-        assert!(!dir.join(WRITE_PROBE).exists(), "探针文件应被清理");
+        let leftovers = std::fs::read_dir(&dir)
+            .expect("读取目录失败")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_PROBE_PREFIX)
+            })
+            .count();
+        assert_eq!(leftovers, 0, "探针文件应被清理");
 
         // 空 / 全是空白 -> 拒绝
         assert!(validate_download_dir("   ").is_err());

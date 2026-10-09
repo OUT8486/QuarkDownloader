@@ -13,7 +13,7 @@
 ## 修复记录（本次已实施）
 
 > 前端改动经 `npm run lint`（exit 0，修复前 3 errors + 1 warning）与 `npm run build`（exit 0）**实测通过**。
-> Rust 改动已在本地**真实编译验证**：`cargo check --all-targets` exit 0（本仓库代码零警告）、`cargo test` exit 0（6/6 通过）、`cargo clippy`（见下）。
+> Rust 改动已在本地**真实编译验证**：`cargo check --all-targets` exit 0（本仓库代码零警告）、`cargo test` exit 0（**10/10 通过**）、`cargo clippy` 零警告。
 > 工具链：rustc 1.99.0 / cargo 1.99.0（`x86_64-pc-windows-gnu`，GNU 链接器）。`Cargo.lock` 已把 `tauri` 从 2.10.2 更新到 **2.12.2**。
 
 ### A. 安全
@@ -25,7 +25,7 @@
 - `src-tauri/tauri.conf.json`：`"csp": null` → 白名单 CSP（`default-src 'self' tauri: asset: …`，`connect-src` 含 `ipc:`/`http://ipc.localhost`/`http://127.0.0.1:3000`/dev server 与 HMR ws）。
 - `src-tauri/src/api_server.rs`：`__puus` 捕获改为"取**最后一个非空**值"，删除型 Cookie（`__puus=; Max-Age=0`）不再覆盖有效值；同时删掉了重复判断的冗余分支。
 - 未做 `AppManifest`：它与 capability 强耦合，贸然声明会让**本地前端**也被 ACL 拒绝（自定义命令必须同时在 capabilities 里放行），而 2.11.1 已关闭远程路径，故不引入这个无法编译验证的风险。
-- `tauri-plugin-shell` 暂未移除（报告中已说明它不可被远程利用，属爆炸半径问题）。
+- ~~`tauri-plugin-shell` 暂未移除~~ **已在第二轮修复中移除**（见 G 节）：依赖、`.plugin()` 注册与 `shell:allow-spawn`/`shell:allow-kill` 授权一并删除，缩小爆炸半径。
 
 ### B. 下载正确性与数据安全
 - `download_segment_once`：强制 206；**校验 `Content-Range` 前缀**；循环后**校验实际字节数 == 期望**；`download_segment` 外层加 3 次重试 + 退避。
@@ -78,6 +78,39 @@
 - **软件设置**：新增 `src-tauri/src/settings.rs`（settings.json 持久化 + 绝对路径/文件/可创建/可写四重校验，写入探针文件验证可写性，配置损坏自动回退默认值）；三个新命令 `get_settings` / `set_download_dir`（`path: null` 即恢复默认）/ `open_download_dir`（资源管理器打开）；`download_file` 改为读取配置目录，配置目录失效时回退系统默认并留日志；新增 `tauri-plugin-dialog` + `dialog:allow-open` 提供**原生目录选择器**；设置页含下载目录、下载线程/并发（从侧边栏迁入，避免重复控件）、解析历史计数与清空、关于；启动时打印一次生效的下载目录，便于排查"文件下到哪了"。
   - 配置文件位置：`%APPDATA%\com.quark.downloader\settings.json`（`app_config_dir/settings.json`）。
 
+### G. 第二轮修复（发布前独立审查发现的问题）
+
+发布前又做了三路独立对抗式审查（新调度器 / Rust 后端 / 旧清单逐条复核），发现并修复：
+
+**G1. 下载管理：3 个"批次永久卡死"级缺陷（前端）**
+- 「全部继续」会把**已结束**的任务复活成幽灵并发额度（`parkedIds` 从不清理 + `unparkAllTasks` 缺已结束守卫），使 `hasPendingWork()` 永真、批次收尾循环永久等待，"开始任务"永久禁用且「全部取消」也救不回来。修复：`finishTask`/`forgetTask` 清理全部记账（新增 `pipelineIds` 识别幽灵额度），`unparkAllTasks` 跳过已结束任务，`abandonPendingTasks` 丢弃无流水线的幽灵额度。
+- 单任务暂停 + 全部暂停 + 全部继续后，Rust 侧单任务暂停标志仍为真 → 行显示"下载中"却 0 B/s 到永远、整批不结束。修复：`unparkAllTasks` 对在途任务补发 `invoke('resume_task')`。
+- 暂停/继续在 `await` 之后不复检任务状态 → 已完成的行被改回"已暂停/下载中"并留下幽灵额度。修复：每次 IPC 后用 `findLiveTask` 复检，命中即 `forgetTask` 并返回 false。
+- 另外修复：「全部继续」对单任务暂停行无效却提示"没有暂停中的任务"（改为退化为逐行恢复）；转存超时把文件静默留在网盘（预算 20→40 次、补查一次、拿到 fid 就兜底删除、拿不到则明确 warning）；非在途任务不必要的 `cancel_task` 调用（并在 Rust 侧消除对应泄漏）；取消判定改为**本地状态优先**，服务端文案仅作窄化兜底；新批次任务行与旧批次交错排列；批次暂停状态收敛到 store（`batchPaused`）作为唯一真值，两个视图不再各存一份。
+
+**G2. Rust：合并阶段的单任务取消失效（用户可见）**
+- 合并结束后只检查了全局取消代际，没检查单任务取消标志 → 用户对大文件点「取消」，合并完仍返回成功、任务行变绿。修复：合并后与单线程收尾都同时检查 `is_cancelled(epoch) || task_cancelled(id)` 并删除半成品。
+- 顺带加固：`download_file` 的早退分支（URL/文件名/预留路径校验失败）补 `clear_task`，不再泄漏状态表条目；启动时先固化 epoch 再判取消，堵住"取消全部"与任务启动之间的窄竞态；`on_navigation` 现在真的重置全局暂停与任务状态（与注释里"刷新 == 取消"一致）；重定向目标也要过 `validate_download_url`（不再只校验初始 URL）。
+
+**G3. 设置持久化**
+- `settings.json` 改为"写临时文件 + 原子替换"，避免截断写入期间被并发读成空 → 静默回退系统下载目录。
+- 写权限探针改为**唯一文件名 + `create_new`**：既不覆盖用户目录里同名文件，也不受上次异常退出残留探针影响。
+
+**G4. 固定端口与登录凭证（安全）**
+- 前端新增**内嵌服务身份校验**：第一次请求前探测 `/api/health`，确认是本应用（`service: quark-api-rust`）才注入 `x-cookie`；否则拒绝发送并给出明确中文错误 —— 防的是"127.0.0.1:3000 被别的本地程序抢占后，登录 Cookie 被发给它"。连接类失败会重试而不是永久缓存失败（避免启动瞬间误判）。
+- 后端绑定端口失败不再 `expect` panic（那样窗口照开、接口全废且无提示），改为打印醒目错误并让应用继续运行。
+- 内嵌服务 CORS 从 `Any/Any/Any` 收紧为来源白名单（dev server 1420 + `http://tauri.localhost` + `tauri://localhost`），不再是"任意本地网页都能调用这个代理"。
+- 登录改为**先校验后写入**：用待验证的 Cookie 直接发请求，通过才写 localStorage，验证失败/中途异常都不会破坏已有登录状态。
+
+**G5. 清理与文档**
+- 删除脚手架残留：`frontend/src/App.css`、`frontend/src/assets/react.svg`、`frontend/public/vite.svg`；favicon 改用应用图标（`frontend/public/icon.png`）；`frontend/package.json` 补 `engines.node`。
+- 移除完全未使用的 `tauri-plugin-shell`（依赖 + 注册 + `shell:allow-spawn`/`shell:allow-kill` 授权）。
+- 二维码登录的 Cookie 拼接改用统一的 `build_cookie_header`（同名去重），不再可能出现重复/过期的 `__puus`、`__uid`。
+- README：修正 tauri 版本说明（锁 2.12.2，不再声称"待升级"）、暂停语义（转存已发出时无法中断）、新增「常见问题」章节（端口占用 / 网盘残留 / 临时分片 / 日志位置）。
+- **更正一条先前的错误结论**：`core:window:allow-is-maximized` **不是**冗余授权 —— `TitleBar.tsx` 用 `appWindow.isMaximized()` 渲染最大化图标，删掉会导致权限拒绝、图标状态失效。已保留。
+
+**仍未处理（有意为之，均为低危或需要你决策）**：安装包签名/公证、前端单 chunk 593 KB 拆包、macOS 图标集（`icon.png` 可由打包器合成 icns）、`tauri-plugin-log` 持久化日志、`target="_blank"` 外链点击无效（需引入 opener 插件）、`is_trusted_origin` 允许任意 localhost 端口（Tauri 内部仍将非 app/dev 来源判为 Remote，不可达 IPC）、合并过程本身不可中断。
+
 ### 本次验证（命令与结果）
 | 检查 | 结果 |
 |---|---|
@@ -91,6 +124,10 @@
 | Rust 语法闸门（ast-grep `kind: ERROR`，tree-sitter） | 三个 `.rs` **0 findings**；反例文件能报错（闸门有效） |
 | CI YAML 解析（PyYAML） | 通过（`jobs=[lint,build]`、`build.needs=lint`） |
 | 锁文件同步 | 根与前端 `npm ci --dry-run` 均 exit 0 |
+| **发布构建** `npm run tauri:build` | **release 编译成功**（`Finished release profile in 2m35s`），产物：`quark-downloader-pro.exe` 27.36 MB、`Quark Downloader Pro_0.1.0_x64_en-US.msi` 9.26 MB、`Quark Downloader Pro_0.1.0_x64-setup.exe`（NSIS）6.54 MB |
+| **生产模式实跑**（release exe + 内嵌 dist） | 启动成功：`[settings] 下载目录` / `[quark-api] 内嵌服务已启动` / 页面导航事件 / 前端 JS 挂载并成功 IPC（epoch 1→2）；`/api/health` 返回 `{"ok":true,"service":"quark-api-rust"}` |
+| **CORS 白名单实测** | `Origin: http://tauri.localhost` → 回显该来源（放行）；`http://127.0.0.1:1420` → 放行；`http://evil.example`、`https://attacker.test` → **无 `Access-Control-Allow-Origin`**（拒绝） |
+| **GNU 工具链产物依赖检查** | release exe 的导入表**不含** `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` / `libstdc++-6.dll` → 在未安装 MinGW 的机器上可直接运行 |
 
 编译过程中唯一残留的警告来自 build script 的 MinGW 链接器（`corrupt .drectve at end of def file`），属 GNU 工具链对 tauri-build 生成的 `.def` 的固有提示，与本仓库代码无关（MSVC 工具链下不会出现）。
 
@@ -99,13 +136,20 @@
 > - `cargo test` 的两个设置类用例会在 `src/settings.rs:76` 建临时目录时被拒而失败；同样把 `TEMP` 指到工作区内后 **10/10 全通过**。
 > - WebView2 无法在 `%LOCALAPPDATA%\com.quark.downloader` 建 profile（`0x800700AA`/`0x8000FFFF`）；把 `WEBVIEW2_USER_DATA_FOLDER` 指到工作区内目录即正常启动（已验证）。**这只影响本会话内的自动化验证**，你在普通终端里运行不受影响。
 > - 验证期间被你此前强杀的实例弄脏的原 profile 已备份并**原样还原**（`EBWebView`，localStorage 完好，时间戳未变）；临时验证 profile 已删除。
+>
+> **打包工具下载超时的解决办法（本机实测）**：`tauri build` 首次打包时会自行下载 WiX / NSIS 工具包，在本机网络上会以 `failed to bundle project timeout: global` 失败（WiX 包 39 MB）。手动预置即可绕过：把
+> `wix314-binaries.zip`（wixtoolset/wix3 的 wix3141rtm 资源）解压到 `%LOCALAPPDATA%\tauri\WixTools314`；
+> 把 `nsis-3.11.zip`（tauri-apps/binary-releases 的 nsis-3.11 资源）**剥掉顶层目录**解压到 `%LOCALAPPDATA%\tauri\NSIS`（即 `NSIS\Bin\makensis.exe`），
+> 并把 `nsis_tauri_utils.dll`（tauri-apps/nsis-tauri-utils 的 nsis_tauri_utils-v0.5.3 资源）放到 `NSIS\Plugins\x86-unicode\additional\` 与 `%LOCALAPPDATA%\tauri\` 两处。
+> 打包器会按固定清单校验（`Bin/makensis.exe`、`Stubs/lzma-*`、`Plugins/x86-unicode/additional/nsis_tauri_utils.dll`、`Include/*.nsh` 共 12 项），缺一项就会删目录重下。
 
 ### 仍需你处理 / 决策
 1. ~~Rust 未编译验证~~ **已完成**：`cargo check` / `cargo test`（10/10）/ `cargo clippy`（零警告）全部通过，`Cargo.lock` 已更新到 tauri 2.12.2。
-2. **CSP 需实机确认**：若出现白屏或 IPC 失败，把 `src-tauri/tauri.conf.json` 的 `csp` 改回 `null` 即可（其他安全修复不受影响）。
-3. **逐任务暂停/继续/取消需要在真机上点一次确认**：单测覆盖了闸门语义与任务隔离，实跑覆盖了启动与 IPC，但"点某一行暂停、进度停住、点继续接着下"只有你能看到。
-4. 低优先级未动：安装包签名/公证、593 KB 单 chunk 拆分、`frontend/src/App.css` 与 `assets/react.svg` 两个未使用文件的删除、`core:window:allow-is-maximized` 冗余授权、给 `logs` 加持久化。
+2. **CSP 与 CORS 白名单需实机确认**：若出现白屏 / IPC 失败，把 `src-tauri/tauri.conf.json` 的 `csp` 改回 `null`；若生产环境提示跨域错误，检查 `src-tauri/src/api_server.rs` 的 `allowed_origins()`（需要包含 `http://tauri.localhost`）。
+3. **逐任务暂停/继续/取消需要在真机上点一次确认**：单测与三路独立审查覆盖了闸门语义、任务隔离与状态机，实跑覆盖了启动与 IPC，但"点某一行暂停、进度停住、点继续接着下"只有你能看到。
+4. 低优先级未动（均为低危，不影响发布）：安装包签名/公证、593 KB 单 chunk 拆包、macOS 图标集、`tauri-plugin-log` 持久化日志、`target="_blank"` 外链（需引入 opener 插件）、`is_trusted_origin` 允许任意 localhost 端口。
 5. 端到端仍需一次真机点击测试（登录 + 真实下载），这部分无法由编译验证覆盖。
+6. **发布到 GitHub 前**：仓库当前**没有任何提交、也没有 remote**（`git log` 为空、`git remote -v` 为空），需要先 `git init` → 提交 → 关联远程 → 打 tag；`.github/workflows/release.yml` 由 tag 触发并需要手动填 `tag` 输入。
 
 ---
 

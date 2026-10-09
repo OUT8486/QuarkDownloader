@@ -8,13 +8,35 @@ use axum::{
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tower_http::cors::{CorsLayer, Any};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::quark_client;
 
+/// 允许的来源白名单：只有本应用自己的页面才需要访问这个内嵌服务。
+///
+/// - 开发模式：Vite dev server（127.0.0.1 / localhost:1420）
+/// - 生产模式：Tauri 的本地来源（Windows 为 http://tauri.localhost，macOS/Linux 为 tauri://localhost）
+///
+/// 不再使用 `Any`：否则用户浏览器里的任意网页都能调用这个本地代理。
+fn allowed_origins() -> AllowOrigin {
+    const ORIGINS: [&str; 4] = [
+        "http://127.0.0.1:1420",
+        "http://localhost:1420",
+        "http://tauri.localhost",
+        "tauri://localhost",
+    ];
+
+    AllowOrigin::list(
+        ORIGINS
+            .iter()
+            .filter_map(|origin| origin.parse().ok())
+            .collect::<Vec<header::HeaderValue>>(),
+    )
+}
+
 pub fn create_router() -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(allowed_origins())
         .allow_methods(Any)
         .allow_headers(Any)
         .expose_headers([header::HeaderName::from_static("x-append-cookie")]);
