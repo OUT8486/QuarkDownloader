@@ -1,0 +1,34 @@
+[package]
+name = "quark-downloader-pro"
+version = "0.1.0"
+description = "Quark Downloader Pro desktop shell"
+authors = ["quark-team"]
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 注意：>= 2.11.1 是安全下限。2.11.1 之前的版本在未配置 AppManifest 时，
+# 自定义（非插件）命令会完全绕过 ACL 检查，远程来源可直接 invoke
+# `download_file`（参数含 url 与 filename），配合任意导航即构成任意文件写入。
+# 升级后请执行一次 `cargo build`（或 `cargo update -p tauri`）刷新 Cargo.lock。
+tauri = { version = "2.11.1", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-os = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "native-tls"], default-features = false }
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+urlencoding = "2"
+bytes = "1"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      # 手动触发时必须给出真实版本标签，否则 tauri-action 会用分支名（例如 main）建 Release，
+      # 从而产生 releases/tag/main 这类无意义的标签。
+      tag:
+        description: '用于发布和上传产物的版本标签，例如 v0.1.0（手动触发必填）'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 发布前的静态检查：此前仓库没有任何 lint/构建校验，即使 ESLint 报错也能直接发版。
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Lint frontend
+        run: npm --prefix frontend run lint
+
+  build:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+          # GitHub 的 macos-15 镜像已经是 arm64；x64（Intel）的 macOS 15 镜像标签是 macos-15-intel。
+          # 若继续写 macos-15，"macos-x64" 实际会变成在 Apple Silicon 上为 x86_64 做交叉编译，
+          # 与 label 声称的「原生 Intel 构建」不符，因此这里改用 macos-15-intel。
+          - platform: macos-15-intel
+            target: x86_64-apple-darwin
+            label: macos-x64
+
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      # @tauri-apps/cli 已在 frontend/package.json 中声明并由 frontend/package-lock.json 锁定
+      # （^2.2.5 -> 2.10.0）。此前额外执行的 `npm install @tauri-apps/cli` 会在 CI 中拉取更新的
+      # 2.x 版本并改写 lockfile，使构建不可复现，故已删除。
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: npx --prefix frontend tauri
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: 'Quark Downloader Pro ${{ inputs.tag || github.ref_name }}'
+          releaseBody: |
+            See the assets below to download the installer for your platform.
+
+            ## Changes
+            - See [commit history](https://github.com/${{ github.repository }}/commits/${{ inputs.tag || github.ref_name }}) for details.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}
