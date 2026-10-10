@@ -1,6 +1,6 @@
 <div align="center">
 
-# Quark Downloader Pro
+# QuarkDownloader
 
 **夸克网盘分享链接批量下载工具**
 
@@ -14,7 +14,7 @@
 一个基于 **Tauri 2 + React 19** 构建的跨平台桌面应用，用于解析夸克网盘分享链接并批量下载文件。
 支持扫码登录、Cookie 登录（含后端校验）、递归目录解析、文件树展示、可调并发批量下载。
 
-**绿色便携版** — 无需安装，双击即用（exe 与 `WebView2Loader.dll` 需放在同一目录）；Windows 同时提供 MSI / NSIS 安装包  ☛[前往 Releases 下载](https://github.com/OP404OP/quarkdownloaderpro/releases)
+**绿色便携版** — 无需安装，双击即用（exe 与 `WebView2Loader.dll` 需放在同一目录）；Windows 同时提供 MSI / NSIS 安装包  ☛[前往 Releases 下载](https://github.com/OUT8486/QuarkDownloader/releases)
 
 </div>
 
@@ -91,8 +91,8 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/OP404OP/quarkdownloaderpro.git
-cd quarkdownloaderpro
+git clone https://github.com/OUT8486/QuarkDownloader.git
+cd QuarkDownloader
 
 # 安装根目录依赖
 npm install
@@ -131,13 +131,13 @@ npm run tauri:build
 
 > 交叉编译需先安装对应 target：`rustup target add <target-triple>`
 
-> **Windows 产物必须带 `WebView2Loader.dll`**：本项目的 Windows 构建使用 `x86_64-pc-windows-gnu`（GNU）工具链，Tauri 的 WebView2 绑定在 GNU 下是**动态链接**（只有 MSVC 工具链才会静态链接进 exe），因此 `quark-downloader-pro.exe` 必须与 `WebView2Loader.dll` 放在同一目录才能启动 —— 单独把 exe 拷到别处会一闪而过（缺 DLL，退出码 `0xC0000135`）。MSI / NSIS 安装包与免安装 ZIP 都已包含该 DLL，配置见 `src-tauri/tauri.windows.conf.json`。
+> **Windows 产物必须带 `WebView2Loader.dll`**：本项目的 Windows 构建使用 `x86_64-pc-windows-gnu`（GNU）工具链，Tauri 的 WebView2 绑定在 GNU 下是**动态链接**（只有 MSVC 工具链才会静态链接进 exe），因此 `QuarkDownloader.exe` 必须与 `WebView2Loader.dll` 放在同一目录才能启动 —— 单独把 exe 拷到别处会一闪而过（缺 DLL，退出码 `0xC0000135`）。MSI / NSIS 安装包与免安装 ZIP 都已包含该 DLL，配置见 `src-tauri/tauri.windows.conf.json`。
 
 #### 产物路径
 
 | 平台 | 产物 | 路径 |
 |------|------|------|
-| **Windows** | 独立便携 exe，双击直接运行 | `src-tauri/target/release/Quark Downloader Pro.exe` |
+| **Windows** | 独立便携 exe，双击直接运行 | `src-tauri/target/release/QuarkDownloader.exe` |
 | **Windows** | MSI 安装包 | `src-tauri/target/release/bundle/msi/*.msi` |
 | **Windows** | NSIS 安装包（`*-setup.exe`） | `src-tauri/target/release/bundle/nsis/*.exe` |
 | **macOS** | .app + .dmg | `src-tauri/target/release/bundle/macos/` 和 `bundle/dmg/` |
@@ -223,7 +223,7 @@ https://pan.quark.cn/s/xxxxxxxxx#/list/share/xxxx
 ## 📁 项目结构
 
 ```
-quarkdownloaderpro/
+QuarkDownloader/
 ├── frontend/                    # 前端 React SPA
 │   ├── src/
 │   │   ├── components/          # 通用 UI 组件
@@ -266,9 +266,6 @@ quarkdownloaderpro/
 │
 ├── .github/
 │   └── workflows/release.yml    # 发布流水线（lint 校验 + 三平台构建）
-│
-├── unused-assets/               # 本地保留但不参与打包的资源（已在 .gitignore 中忽略）
-│   └── fonts/                   # 体积过大的备用字体
 │
 ├── package.json                 # 根 monorepo 脚本
 └── README.md

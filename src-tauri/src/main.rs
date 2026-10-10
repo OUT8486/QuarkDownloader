@@ -400,7 +400,7 @@ async fn follow_redirects(
 fn config_dir(app: &tauri::AppHandle) -> PathBuf {
     app.path()
         .app_config_dir()
-        .unwrap_or_else(|_| std::env::temp_dir().join("quark-downloader-pro"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("QuarkDownloader"))
 }
 
 /// 当前生效的下载目录：优先用用户设置的目录，否则用系统默认下载目录
@@ -1244,7 +1244,7 @@ fn main() {
         let detail = info.to_string();
         log_err!("[fatal] {}", detail);
         show_fatal_dialog(
-            "Quark Downloader Pro 启动失败",
+            "QuarkDownloader 启动失败",
             &format!(
                 "应用遇到错误并已退出。\n\n{}\n\n\
                  若为首次运行，请确认系统已安装 Microsoft Edge WebView2 运行时；\n\
@@ -1278,7 +1278,7 @@ fn main() {
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
             )
-            .title("Quark Downloader Pro")
+            .title("QuarkDownloader")
             .inner_size(1024.0, 750.0)
             .min_inner_size(1024.0, 700.0)
             .resizable(true)

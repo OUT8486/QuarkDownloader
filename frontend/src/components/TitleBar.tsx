@@ -136,7 +136,7 @@ export const TitleBar: React.FC = () => {
 
             <div className="flex items-center pl-4" data-tauri-drag-region>
                 <span className="text-xs font-medium text-slate-400 tracking-tight">
-                    Quark Downloader Pro
+                    QuarkDownloader
                 </span>
             </div>
 

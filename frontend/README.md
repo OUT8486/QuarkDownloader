@@ -1,4 +1,4 @@
-# Quark Downloader Pro Frontend
+# QuarkDownloader Frontend
 
 基于 React 19 + TypeScript + TailwindCSS 构建的现代化夸克网盘链接解析工具。
 

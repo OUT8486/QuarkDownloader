@@ -43,7 +43,7 @@ export const HelpView: React.FC = () => {
                         关于软件与使用说明
                     </Badge>
                     <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 leading-tight">
-                        Quark <span className="gradient-text">Downloader Pro</span>
+                        Quark<span className="gradient-text">Downloader</span>
                     </h1>
                 </motion.section>
 
@@ -107,13 +107,13 @@ export const HelpView: React.FC = () => {
                                     </div>
                                 </div>
                                 <a
-                                    href="https://github.com/OP404OP/quarkdownloaderpro"
+                                    href="https://github.com/OUT8486/QuarkDownloader"
                                     target="_blank"
                                     rel="noreferrer"
                                     className="inline-flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-sm font-bold hover:bg-slate-800 transition-colors shadow-lg shadow-slate-200"
                                 >
                                     <Github size={16} />
-                                    GitHub @OP404OP/quarkdownloaderpro
+                                    GitHub @OUT8486/QuarkDownloader
                                     <ExternalLink size={14} className="opacity-50" />
                                 </a>
                             </div>

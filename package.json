@@ -2,7 +2,7 @@
   "name": "quark-desktop-monorepo",
   "private": true,
   "version": "0.1.0",
-  "description": "Quark Downloader Pro desktop migration workspace",
+  "description": "QuarkDownloader desktop workspace",
   "scripts": {
     "dev": "npm --prefix frontend run dev",
     "dev:frontend": "npm --prefix frontend run dev",

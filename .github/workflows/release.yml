@@ -107,7 +107,7 @@ jobs:
         with:
           tauriScript: npx --prefix frontend tauri
           tagName: ${{ inputs.tag || github.ref_name }}
-          releaseName: 'Quark Downloader Pro ${{ inputs.tag || github.ref_name }}'
+          releaseName: 'QuarkDownloader ${{ inputs.tag || github.ref_name }}'
           releaseBody: |
             See the assets below to download the installer for your platform.
 
