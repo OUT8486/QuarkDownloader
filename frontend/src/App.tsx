@@ -23,13 +23,16 @@ interface DownloadProgressEvent {
   status?: string;
 }
 
+// 模块级标记：确保「恢复未完成下载」只执行一次（StrictMode 在开发模式会重复执行 effect）
+let resumeAttempted = false;
+
 function App() {
   const {
     isLoggedIn,
     setCapacity,
     setCapacityLoading,
     shareInfo,
-    dropUnfinishedTasks,
+    restorePendingDownloads,
     updateTask,
     loadSettings,
   } = useQuarkStore();
@@ -37,18 +40,40 @@ function App() {
   const [isAuthOpen, setIsAuthOpen] = useState(false);
   const [activeTab, setActiveTab] = useState('parser');
 
-  // 页面加载/刷新时，立即取消所有残留下载任务
+  // 启动时恢复上次未完成的下载队列：任务按「已暂停」列在下载管理里，
+  // 分片与输出路径留在下载目录，用户点「继续 / 全部继续」时按 taskId 找回断点续传。
+  // 这里刻意不自动续传：重新打开程序后，未完成的任务应该停在暂停态等用户决定何时继续。
   useEffect(() => {
-    invoke('cancel_downloads').catch(() => {});
-    // 刷新后 Rust 侧任务已被 on_navigation 的 epoch 重置清空，
-    // 因此只保留已完成的任务行，丢掉所有未结束的残留（含暂停、下载中）
-    dropUnfinishedTasks();
-    const handleBeforeUnload = () => {
-      invoke('cancel_downloads').catch(() => {});
-    };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [dropUnfinishedTasks]);
+    // StrictMode 在开发模式会重复执行 effect，这里保证只恢复一次
+    if (resumeAttempted) return;
+    resumeAttempted = true;
+
+    const restored = restorePendingDownloads();
+    const restoredTasks = restored?.tasks ?? [];
+    // 只保留要续传任务的分片目录，其余残留（例如用户已放弃的任务）一并清掉
+    void invoke('cleanup_stale_temp_dirs', {
+      keepIds: restoredTasks.map((task) => task.id),
+    }).catch(() => {});
+
+    if (!restored || restoredTasks.length === 0) return;
+
+    const { pwdId, stoken } = restored.context;
+    if (!pwdId || !stoken) {
+      // 分享上下文缺失（例如本地缓存被清理过）：没有直链可用，续传不可能成功。
+      // 如实标记为失败，而不是留下一行假装「已暂停」却永远不会动的任务
+      const message = '分享链接上下文已失效，无法继续下载，请重新解析分享链接后再下载';
+      restoredTasks.forEach((task) => {
+        updateTask(task.id, { status: 'failed', error: message, speed: 0, finishedAt: Date.now() });
+      });
+      useQuarkStore.getState().notify(message, 'warn');
+      return;
+    }
+
+    useQuarkStore.getState().notify(
+      `已恢复 ${restoredTasks.length} 个未完成的下载任务（已暂停），可在「下载管理」里继续`,
+      'info'
+    );
+  }, [restorePendingDownloads, updateTask]);
 
   // 下载目录等设置：App 启动就拉一次，设置页与下载相关展示都依赖它
   useEffect(() => {

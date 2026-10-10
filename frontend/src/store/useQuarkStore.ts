@@ -145,6 +145,108 @@ export const isTaskActive = (status: DownloadTaskStatus) => ACTIVE_TASK_STATUSES
 export const isTaskFinished = (status: DownloadTaskStatus) =>
     status === 'done' || status === 'failed' || status === 'cancelled';
 
+/** 一批下载任务共用的上下文：转存与取直链都依赖它 */
+export interface DownloadBatchContext {
+    pwdId: string;
+    stoken: string;
+    shareUrl: string;
+    /** fid -> share_fid_token：转存时要用 */
+    tokenByFid: Record<string, string>;
+}
+
+export const EMPTY_DOWNLOAD_CONTEXT: DownloadBatchContext = {
+    pwdId: '',
+    stoken: '',
+    shareUrl: '',
+    tokenByFid: {},
+};
+
+// 未完成的下载队列落盘：应用被关闭（甚至被强杀）后，下次启动靠它恢复任务并续传。
+// 已结束的任务不落盘——它们只是本次会话的历史记录。
+const PENDING_DOWNLOADS_KEY = 'quark_pending_downloads';
+const PENDING_DOWNLOADS_VERSION = 1;
+const PENDING_TASKS_LIMIT = 200;
+
+export interface PendingDownloadsSnapshot {
+    version: number;
+    context: DownloadBatchContext;
+    tasks: DownloadTask[];
+}
+
+const savePendingDownloads = (tasks: DownloadTask[], context: DownloadBatchContext) => {
+    try {
+        const unfinished = tasks
+            .filter((task) => isTaskActive(task.status))
+            .slice(0, PENDING_TASKS_LIMIT)
+            // 速度是瞬时值，重启后没有意义，不落盘
+            .map((task) => ({ ...task, speed: 0 }));
+        if (unfinished.length === 0) {
+            localStorage.removeItem(PENDING_DOWNLOADS_KEY);
+            return;
+        }
+        const snapshot: PendingDownloadsSnapshot = {
+            version: PENDING_DOWNLOADS_VERSION,
+            context,
+            tasks: unfinished,
+        };
+        localStorage.setItem(PENDING_DOWNLOADS_KEY, JSON.stringify(snapshot));
+    } catch (error: unknown) {
+        console.error('保存未完成下载队列失败', error);
+    }
+};
+
+const loadPendingDownloads = (): PendingDownloadsSnapshot | null => {
+    try {
+        const raw = localStorage.getItem(PENDING_DOWNLOADS_KEY);
+        if (!raw) return null;
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return null;
+        const snapshot = parsed as Partial<PendingDownloadsSnapshot>;
+        if (snapshot.version !== PENDING_DOWNLOADS_VERSION || !Array.isArray(snapshot.tasks)) return null;
+
+        const tasks: DownloadTask[] = [];
+        for (const item of snapshot.tasks) {
+            if (!item || typeof item !== 'object') continue;
+            const task = item as Partial<DownloadTask>;
+            if (typeof task.id !== 'string' || !task.id) continue;
+            if (typeof task.fid !== 'string' || !task.fid) continue;
+            if (typeof task.filename !== 'string' || !task.filename) continue;
+            tasks.push({
+                id: task.id,
+                filename: task.filename,
+                fid: task.fid,
+                size: Number(task.size) || 0,
+                // 一律按「已暂停」恢复：等确认上下文可用后再自动续传
+                status: 'paused',
+                downloaded: Number(task.downloaded) || 0,
+                total: Number(task.total) || Number(task.size) || 0,
+                speed: 0,
+                queueIndex: Number(task.queueIndex) || 0,
+                batchSize: Number(task.batchSize) || undefined,
+                savePath: typeof task.savePath === 'string' ? task.savePath : undefined,
+                startedAt: Number(task.startedAt) || undefined,
+            });
+        }
+        if (tasks.length === 0) return null;
+
+        const ctx = (snapshot.context ?? {}) as Partial<DownloadBatchContext>;
+        return {
+            version: PENDING_DOWNLOADS_VERSION,
+            tasks,
+            context: {
+                pwdId: typeof ctx.pwdId === 'string' ? ctx.pwdId : '',
+                stoken: typeof ctx.stoken === 'string' ? ctx.stoken : '',
+                shareUrl: typeof ctx.shareUrl === 'string' ? ctx.shareUrl : '',
+                tokenByFid:
+                    ctx.tokenByFid && typeof ctx.tokenByFid === 'object' ? { ...ctx.tokenByFid } : {},
+            },
+        };
+    } catch (error: unknown) {
+        console.error('读取未完成下载队列失败，已忽略本地缓存', error);
+        return null;
+    }
+};
+
 // 任务 id 由前端生成：crypto.randomUUID 只在安全上下文可用（Tauri webview 可以），
 // 浏览器调试环境缺失，用时间戳 + 随机串兜底，保证任何环境都不会抛异常
 const createTaskId = () => {
@@ -186,6 +288,7 @@ interface QuarkState {
     downloadConcurrency: number;
     downloadThreads: number;
     downloadTasks: DownloadTask[];
+    downloadContext: DownloadBatchContext;
     parseHistory: ParseHistoryEntry[];
     settings: SettingsState;
     pendingParseUrl: string | null;
@@ -210,7 +313,8 @@ interface QuarkState {
     updateTask: (id: string, patch: Partial<DownloadTask>) => void;
     removeTask: (id: string) => void;
     clearFinishedTasks: () => void;
-    dropUnfinishedTasks: () => void;
+    setDownloadContext: (context: DownloadBatchContext) => void;
+    restorePendingDownloads: () => PendingDownloadsSnapshot | null;
     resetShareInfo: () => void;
     setShareUrl: (url: string) => void;
     addHistory: (entry: ParseHistoryEntry) => void;
@@ -259,6 +363,7 @@ export const useQuarkStore = create<QuarkState>((set) => ({
     downloadThreads: Math.max(1, Math.min(64, Number(localStorage.getItem('download_threads')) || 16)),
     // 每个文件一条任务行：排队顺序、进度与暂停/取消状态都挂在这里（刷新后由 App 挂载时清理残留）
     downloadTasks: [],
+    downloadContext: EMPTY_DOWNLOAD_CONTEXT,
     // 解析历史懒加载：store 创建时读一次本地缓存，之后每次变更都落盘
     parseHistory: loadParseHistory(),
     settings: {
@@ -378,10 +483,14 @@ export const useQuarkStore = create<QuarkState>((set) => ({
         // 只清掉 done/failed/cancelled，进行中的任务行必须保留
         downloadTasks: state.downloadTasks.filter((task) => !isTaskFinished(task.status)),
     })),
-    dropUnfinishedTasks: () => set((state: QuarkState) => ({
-        // 刷新页面后 Rust 侧任务已被 on_navigation 的 epoch 重置清空，只有已完成的行值得保留
-        downloadTasks: state.downloadTasks.filter((task) => task.status === 'done'),
-    })),
+    setDownloadContext: (context: DownloadBatchContext) => set({ downloadContext: context }),
+    // 重启后恢复未完成的下载队列：返回快照供调用方决定是否自动续传
+    restorePendingDownloads: () => {
+        const snapshot = loadPendingDownloads();
+        if (!snapshot) return null;
+        set({ downloadTasks: snapshot.tasks, downloadContext: snapshot.context });
+        return snapshot;
+    },
     resetShareInfo: () => set((state: QuarkState) => ({
         shareInfo: {
             pwdId: '',
@@ -476,3 +585,43 @@ export const useQuarkStore = create<QuarkState>((set) => ({
     requestParse: (url: string) => set({ pendingParseUrl: url }),
     clearPendingParse: () => set({ pendingParseUrl: null }),
 }));
+
+// ── 未完成下载队列的持久化 ───────────────────────────────
+// 任务集合或状态变化时立刻落盘（保证刚创建/刚结束的任务不会丢），
+// 只有进度在变时合并成 1 秒一次，避免每 500ms 的进度事件都写 localStorage。
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let lastPersistSignature = '';
+
+const activeTaskSignature = (tasks: DownloadTask[]) =>
+    tasks
+        .filter((task) => isTaskActive(task.status))
+        .map((task) => `${task.id}:${task.status}`)
+        .join('|');
+
+const flushPendingDownloads = () => {
+    const state = useQuarkStore.getState();
+    savePendingDownloads(state.downloadTasks, state.downloadContext);
+};
+
+useQuarkStore.subscribe((state, prev) => {
+    if (state.downloadTasks === prev.downloadTasks && state.downloadContext === prev.downloadContext) {
+        return;
+    }
+
+    const signature = activeTaskSignature(state.downloadTasks);
+    if (signature !== lastPersistSignature) {
+        lastPersistSignature = signature;
+        if (persistTimer !== null) {
+            clearTimeout(persistTimer);
+            persistTimer = null;
+        }
+        flushPendingDownloads();
+        return;
+    }
+
+    if (persistTimer !== null) return;
+    persistTimer = setTimeout(() => {
+        persistTimer = null;
+        flushPendingDownloads();
+    }, 1000);
+});

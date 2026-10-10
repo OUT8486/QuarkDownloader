@@ -285,6 +285,120 @@ fn build_segments(total_size: u64, thread_count: usize) -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// 任务临时目录名：由前端传入的任务 id 派生。
+/// 这样同一个任务在应用重启后还能找回上次留下的分片（进程被强杀时 RAII 不会执行，
+/// 分片目录与日志会留在磁盘上），从而实现真正的断点续传。
+fn sanitize_task_key(task_id: &str) -> String {
+    let cleaned: String = task_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(48)
+        .collect();
+    if cleaned.is_empty() {
+        "task".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn temp_dir_for(downloads_dir: &Path, task_id: &str) -> PathBuf {
+    downloads_dir.join(format!(".quark_temp_{}", sanitize_task_key(task_id)))
+}
+
+/// 断点续传日志：记录上次的输出路径与分片划分，重启后据此接着下。
+const RESUME_JOURNAL_FILE: &str = "state.json";
+const RESUME_JOURNAL_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResumeJournal {
+    version: u32,
+    save_path: String,
+    total_size: u64,
+    segments: Vec<(u64, u64)>,
+}
+
+/// 续传方案：上次的日志 + 临时目录（分片文件就在里面）
+struct ResumePlan {
+    journal: ResumeJournal,
+    temp_dir: PathBuf,
+}
+
+fn read_resume_journal(temp_dir: &Path) -> Option<ResumeJournal> {
+    let raw = std::fs::read_to_string(temp_dir.join(RESUME_JOURNAL_FILE)).ok()?;
+    let journal: ResumeJournal = serde_json::from_str(&raw).ok()?;
+    if journal.version != RESUME_JOURNAL_VERSION || journal.segments.is_empty() {
+        return None;
+    }
+    Some(journal)
+}
+
+fn write_resume_journal(temp_dir: &Path, journal: &ResumeJournal) {
+    match serde_json::to_string(journal) {
+        Ok(raw) => {
+            if let Err(e) = std::fs::write(temp_dir.join(RESUME_JOURNAL_FILE), raw) {
+                log_err!("[download] 写入续传日志失败: {}", e);
+            }
+        }
+        Err(e) => log_err!("[download] 序列化续传日志失败: {}", e),
+    }
+}
+
+/// 解析本次下载的输出路径：续传时复用上次的路径，否则原子预留一个新名字。
+fn resolve_save_target(
+    downloads_dir: &Path,
+    filename: &str,
+    task_id: &str,
+    want_resume: bool,
+) -> Result<(PathBuf, Option<ResumePlan>), String> {
+    if want_resume {
+        let temp_dir = temp_dir_for(downloads_dir, task_id);
+        if let Some(journal) = read_resume_journal(&temp_dir) {
+            let path = PathBuf::from(&journal.save_path);
+            // 只接受仍在当前下载目录下的路径：用户改过下载目录就重新开始，避免写到别处
+            if path.parent() == Some(downloads_dir) {
+                if !path.exists() {
+                    // 预留时创建的占位文件可能已被清理：重建一个空文件，续传不依赖它的长度
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&path)
+                        .map_err(|e| format!("创建文件失败: {}", e))?;
+                }
+                return Ok((path, Some(ResumePlan { journal, temp_dir })));
+            }
+        }
+    }
+
+    Ok((reserve_save_path(downloads_dir, filename)?, None))
+}
+
+/// 单线程下载同样登记续传日志。单线程没有 Range，做不到字节级续传，
+/// 但记下输出路径后，应用被杀再重启时会复用同一个文件名，
+/// 而不是留下一个截断的旧文件、再另外下一个「xxx (1).ext」。
+async fn register_single_thread_resume(
+    save_path: &Path,
+    total_size: u64,
+    task_id: &str,
+) -> TempDirGuard {
+    let downloads_dir = save_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let temp_dir = temp_dir_for(&downloads_dir, task_id);
+    let _ = tokio::fs::create_dir_all(&temp_dir).await;
+    write_resume_journal(
+        &temp_dir,
+        &ResumeJournal {
+            version: RESUME_JOURNAL_VERSION,
+            save_path: save_path.to_string_lossy().to_string(),
+            total_size,
+            segments: vec![(0, total_size.saturating_sub(1))],
+        },
+    );
+    TempDirGuard(temp_dir)
+}
+
 /// 临时分片目录的 RAII 清理器：任何提前返回（含 `?`）都会尝试删除该目录，
 /// 不会把上千个分片留在用户的下载目录里。
 struct TempDirGuard(PathBuf);
@@ -496,6 +610,50 @@ async fn open_download_dir(app: tauri::AppHandle) -> Result<(), String> {
     spawned.map(|_| ()).map_err(|e| format!("打开目录失败: {}", e))
 }
 
+/// 清理下载目录里不属于当前任务队列的残留分片目录。
+/// 应用被强杀时不会执行 RAII 清理，重启后由前端把"还要继续的任务 id"传进来，
+/// 其余的 `.quark_temp_*` 一律删掉，避免隐藏目录在下载目录里越积越多。
+#[tauri::command]
+async fn cleanup_stale_temp_dirs(
+    app: tauri::AppHandle,
+    keep_ids: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    let downloads_dir = resolve_download_dir(&app);
+    let keep: std::collections::HashSet<String> = keep_ids
+        .unwrap_or_default()
+        .iter()
+        .map(|id| format!(".quark_temp_{}", sanitize_task_key(id)))
+        .collect();
+
+    let mut removed = 0u32;
+    let mut entries = tokio::fs::read_dir(&downloads_dir)
+        .await
+        .map_err(|e| format!("读取下载目录失败: {}", e))?;
+
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with(".quark_temp_") || keep.contains(&name) {
+                    continue;
+                }
+                if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
+                    && tokio::fs::remove_dir_all(entry.path()).await.is_ok()
+                {
+                    removed += 1;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    if removed > 0 {
+        log_line!("[download] 已清理 {} 个残留分片目录", removed);
+    }
+    Ok(serde_json::json!({ "removed": removed }))
+}
+
 // ── Tauri 命令入口 ───────────────────────────────────────
 
 /// 取消所有正在进行的下载（epoch +1 → 旧任务自动失效）
@@ -557,6 +715,7 @@ async fn download_file(
     filename: String,
     thread_count: Option<usize>,
     task_id: Option<String>,
+    resume: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     // 线程数：1..=64（与前端滑块/数字框一致）
     let thread_count = thread_count.unwrap_or(DEFAULT_THREADS).clamp(1, MAX_THREADS);
@@ -597,9 +756,15 @@ async fn download_file(
 
     // 下载目录：优先用"软件设置"里配置的目录，否则系统默认下载目录
     let downloads_dir = resolve_download_dir(&app);
-    // 原子预留输出路径：并发下载同名文件时不会选中同一个目标
-    let save_path = match reserve_save_path(&downloads_dir, &filename) {
-        Ok(path) => path,
+    // 输出路径：续传时复用上次的路径与分片，否则原子预留一个新名字
+    // （原子预留保证并发下载同名文件时不会选中同一个目标）
+    let (save_path, resume_plan) = match resolve_save_target(
+        &downloads_dir,
+        &filename,
+        &download_id,
+        resume.unwrap_or(false),
+    ) {
+        Ok(target) => target,
         Err(e) => {
             clear_task(&download_id);
             return Err(e);
@@ -612,7 +777,18 @@ async fn download_file(
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
 
     tokio::spawn(async move {
-        let result = do_download(app, url, cookie, filename, save_path, epoch, download_id, thread_count).await;
+        let result = do_download(
+            app,
+            url,
+            cookie,
+            filename,
+            save_path,
+            epoch,
+            download_id,
+            thread_count,
+            resume_plan,
+        )
+        .await;
         let _ = tx.send(result);
     });
 
@@ -649,6 +825,7 @@ async fn do_download(
     epoch: u64,
     download_id: String,
     thread_count: usize,
+    resume: Option<ResumePlan>,
 ) -> Result<serde_json::Value, String> {
     if is_cancelled(epoch) {
         return Err("下载已取消".into());
@@ -699,10 +876,23 @@ async fn do_download(
     if accept_ranges && total_size >= MIN_MULTITHREAD_SIZE {
         drop(resp);
         log_line!("[download] 启用 {} 线程并行下载", thread_count);
-        download_multithread(app, client, final_url, cookie, filename, save_path, total_size, epoch, download_id, thread_count)
-            .await
+        download_multithread(
+            app,
+            client,
+            final_url,
+            cookie,
+            filename,
+            save_path,
+            total_size,
+            epoch,
+            download_id,
+            thread_count,
+            resume,
+        )
+        .await
     } else {
         log_line!("[download] 使用单线程下载 (Range 不支持或文件较小)");
+        let _single_guard = register_single_thread_resume(&save_path, total_size, &download_id).await;
         download_single(app, resp, filename, save_path, total_size, epoch, download_id).await
     }
 }
@@ -721,24 +911,47 @@ async fn download_multithread(
     epoch: u64,
     download_id: String,
     thread_count: usize,
+    resume: Option<ResumePlan>,
 ) -> Result<serde_json::Value, String> {
-    // 1. 为本次下载创建独立临时目录（RAII 兜底清理）
-    let temp_id = uuid::Uuid::new_v4();
-    let temp_dir = save_path
+    // 1. 临时目录按任务 id 派生，重启后能找回上次的分片（RAII 兜底清理）
+    let downloads_dir = save_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join(format!(".quark_temp_{}", &temp_id.to_string()[..8]));
+        .to_path_buf();
+    let temp_dir = match &resume {
+        Some(plan) => plan.temp_dir.clone(),
+        None => temp_dir_for(&downloads_dir, &download_id),
+    };
+    if resume.is_none() {
+        // 全新下载：清掉同一任务可能残留的旧分片，避免和这次的数据混在一起
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
     tokio::fs::create_dir_all(&temp_dir)
         .await
         .map_err(|e| format!("创建临时目录失败: {}", e))?;
     let _temp_guard = TempDirGuard(temp_dir.clone());
 
-    // 2. 计算各段字节范围（分片数不超过总字节数，避免 0 长度区间与下溢）
-    let segments = build_segments(total_size, thread_count);
+    // 2. 计算各段字节范围（分片数不超过总字节数，避免 0 长度区间与下溢）。
+    //    续传必须沿用上次的划分：chunk_i 与区间一一对应，线程数变了旧分片就对不上
+    let segments = match &resume {
+        Some(plan) if plan.journal.total_size == total_size => plan.journal.segments.clone(),
+        _ => build_segments(total_size, thread_count),
+    };
     if segments.is_empty() {
         return Err("文件大小异常（0 字节），无法分片下载".to_string());
     }
     let thread_count = segments.len();
+
+    // 落盘续传日志：应用被强杀后，下次启动靠它找回输出路径与分片划分
+    write_resume_journal(
+        &temp_dir,
+        &ResumeJournal {
+            version: RESUME_JOURNAL_VERSION,
+            save_path: save_path.to_string_lossy().to_string(),
+            total_size,
+            segments: segments.clone(),
+        },
+    );
 
     for (i, (s, e)) in segments.iter().enumerate() {
         log_line!(
@@ -750,18 +963,30 @@ async fn download_multithread(
         );
     }
 
-    // 3. 每段独立的进度原子计数器
-    let seg_progresses: Vec<Arc<AtomicU64>> = (0..thread_count)
-        .map(|_| Arc::new(AtomicU64::new(0)))
-        .collect();
+    // 3. 每段独立的进度原子计数器：续传时以已落盘的字节数作为初值，
+    //    否则监控会从 0 起算，进度条先倒退再前进
+    let mut seg_progresses: Vec<Arc<AtomicU64>> = Vec::with_capacity(thread_count);
+    for (s, e) in segments.iter() {
+        let seg_len = e - s + 1;
+        let existing = tokio::fs::metadata(temp_dir.join(format!("chunk_{}", seg_progresses.len())))
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        seg_progresses.push(Arc::new(AtomicU64::new(existing.min(seg_len))));
+    }
 
     // 4. 进度监控任务
     let monitor_app = app.clone();
     let monitor_filename = filename.clone();
     let monitor_id = download_id.clone();
     let monitor_segs: Vec<Arc<AtomicU64>> = seg_progresses.iter().map(Arc::clone).collect();
+    let initial_downloaded: u64 = seg_progresses
+        .iter()
+        .map(|a| a.load(Ordering::Relaxed))
+        .sum();
     let monitor = tokio::spawn(async move {
-        let mut last_downloaded: u64 = 0;
+        // 从续传起点开始记账：第一帧速度才不会把"已下载的历史字节"当成瞬时速度
+        let mut last_downloaded: u64 = initial_downloaded;
         let mut last_time = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -938,8 +1163,8 @@ async fn download_segment(
             return Err("下载已取消".into());
         }
         if attempt > 1 {
-            // 退避后重试：重置进度，避免监视器把重试算成"倒退"
-            progress.store(0, Ordering::Relaxed);
+            // 退避后重试：上一次尝试已落盘的字节会被续传逻辑复用，
+            // 进度不会倒退，因此这里不再清零计数器
             log_line!("[download] 段{} 第 {} 次尝试", index, attempt);
             tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
         }
@@ -974,7 +1199,25 @@ async fn download_segment_once(
     epoch: u64,
     task_id: &str,
 ) -> Result<(), String> {
-    let range_header = format!("bytes={}-{}", start, end);
+    let expected = end - start + 1;
+
+    // 断点续传：分片文件里已落盘的字节数就是这一段的进度（顺序追加，内容一定是前缀）。
+    // 超过区间长度说明旧文件对不上，直接丢弃重来，避免错位合并
+    let mut offset = tokio::fs::metadata(chunk_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if offset > expected {
+        let _ = tokio::fs::remove_file(chunk_path).await;
+        offset = 0;
+    }
+    if offset == expected {
+        progress.store(offset, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    let range_start = start + offset;
+    let range_header = format!("bytes={}-{}", range_start, end);
 
     let resp = add_headers(client.get(url), cookie)
         .header("Range", &range_header)
@@ -989,7 +1232,7 @@ async fn download_segment_once(
 
     // 校验 Content-Range：确认服务端真的按请求的区间返回，
     // 否则会把别的区间/别的数据当成这一片写进去（错位合并）
-    let expected_prefix = format!("bytes {}-{}", start, end);
+    let expected_prefix = format!("bytes {}-{}", range_start, end);
     match resp
         .headers()
         .get("content-range")
@@ -1005,14 +1248,17 @@ async fn download_segment_once(
         None => return Err("响应缺少 Content-Range 头".to_string()),
     }
 
-    let file = tokio::fs::File::create(chunk_path)
+    // 追加写入：已落盘的部分保留，只补后面缺的字节
+    let file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(chunk_path)
         .await
-        .map_err(|e| format!("创建临时文件失败: {}", e))?;
+        .map_err(|e| format!("打开临时文件失败: {}", e))?;
 
     let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
     let mut resp = resp;
-    let mut seg_downloaded: u64 = 0;
-    let expected = end - start + 1;
+    let mut seg_downloaded: u64 = offset;
 
     loop {
         if is_cancelled(epoch) {
@@ -1268,7 +1514,8 @@ fn main() {
             cancel_task,
             get_settings,
             set_download_dir,
-            open_download_dir
+            open_download_dir,
+            cleanup_stale_temp_dirs
         ])
         .setup(|app| {
             // 手动创建主窗口（而非 tauri.conf.json 自动创建），
@@ -1541,5 +1788,267 @@ mod tests {
             .is_ok(),
             "清理后该任务不应再被暂停影响"
         );
+    }
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("quark-test-{}-{}", tag, uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn task_temp_dir_is_stable_and_sanitized() {
+        // 同一个任务 id 必须映射到同一个目录（重启后才能找回分片）
+        assert_eq!(sanitize_task_key("abc-123"), "abc-123");
+        assert_eq!(sanitize_task_key("abc-123"), sanitize_task_key("abc-123"));
+        // 路径分隔符等危险字符会被过滤，避免越出下载目录
+        assert_eq!(sanitize_task_key("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_task_key("a\\b/c"), "abc");
+        assert_eq!(sanitize_task_key(""), "task");
+        assert_eq!(sanitize_task_key("///"), "task");
+
+        let dir = Path::new("/downloads");
+        assert_eq!(
+            temp_dir_for(dir, "abc-123"),
+            Path::new("/downloads/.quark_temp_abc-123")
+        );
+    }
+
+    #[test]
+    fn resume_journal_round_trips_and_rejects_junk() {
+        let dir = unique_temp_dir("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 没有日志时不应误判为可续传
+        assert!(read_resume_journal(&dir).is_none());
+
+        let journal = ResumeJournal {
+            version: RESUME_JOURNAL_VERSION,
+            save_path: "/downloads/movie.zip".to_string(),
+            total_size: 2048,
+            segments: vec![(0, 1023), (1024, 2047)],
+        };
+        write_resume_journal(&dir, &journal);
+
+        let read = read_resume_journal(&dir).expect("日志应能读回");
+        assert_eq!(read.save_path, "/downloads/movie.zip");
+        assert_eq!(read.total_size, 2048);
+        assert_eq!(read.segments, vec![(0, 1023), (1024, 2047)]);
+
+        // 损坏/过期日志必须被忽略，而不是拿来续传
+        std::fs::write(dir.join(RESUME_JOURNAL_FILE), b"{ not json").unwrap();
+        assert!(read_resume_journal(&dir).is_none());
+        std::fs::write(
+            dir.join(RESUME_JOURNAL_FILE),
+            serde_json::to_string(&ResumeJournal {
+                version: RESUME_JOURNAL_VERSION + 1,
+                save_path: "/downloads/movie.zip".to_string(),
+                total_size: 2048,
+                segments: vec![(0, 2047)],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(read_resume_journal(&dir).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_save_target_reuses_previous_path_only_when_asked() {
+        let dir = unique_temp_dir("resolve-target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let task_id = "task-abc";
+
+        // 全新下载：原子预留一个新名字
+        let (path, plan) = resolve_save_target(&dir, "movie.zip", task_id, false).unwrap();
+        assert!(plan.is_none());
+        assert_eq!(path.file_name().unwrap(), "movie.zip");
+
+        // 模拟「下载中途被杀」：留下分片目录与续传日志
+        let temp_dir = temp_dir_for(&dir, task_id);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        write_resume_journal(
+            &temp_dir,
+            &ResumeJournal {
+                version: RESUME_JOURNAL_VERSION,
+                save_path: path.to_string_lossy().to_string(),
+                total_size: 1234,
+                segments: vec![(0, 616), (617, 1233)],
+            },
+        );
+
+        // 续传：必须复用同一个输出路径，否则会在下载目录里多出一个「movie (1).zip」
+        let (resumed_path, plan) = resolve_save_target(&dir, "movie.zip", task_id, true).unwrap();
+        assert_eq!(resumed_path, path);
+        let plan = plan.expect("续传应带回日志");
+        assert_eq!(plan.journal.total_size, 1234);
+        assert_eq!(plan.journal.segments, vec![(0, 616), (617, 1233)]);
+
+        // 明确不续传时：即使有日志也必须预留新路径，不能覆盖已有文件
+        let (fresh, plan) = resolve_save_target(&dir, "movie.zip", task_id, false).unwrap();
+        assert!(plan.is_none());
+        assert_ne!(fresh, path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 最小可用的 Range 服务器：按 `Range: bytes=x-y` 返回 206 + Content-Range，
+    /// 用来真实验证「截断后继续下载」得到的文件逐字节正确。
+    async fn spawn_range_server(body: Vec<u8>, hits: Arc<AtomicU64>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                let hits = Arc::clone(&hits);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    hits.fetch_add(1, Ordering::SeqCst);
+
+                    let total = body.len();
+                    let mut start = 0usize;
+                    let mut end = total.saturating_sub(1);
+                    let mut partial = false;
+
+                    for line in req.lines() {
+                        let is_range = line
+                            .get(..6)
+                            .map(|p| p.eq_ignore_ascii_case("range:"))
+                            .unwrap_or(false);
+                        if !is_range {
+                            continue;
+                        }
+                        let spec = match line[6..].trim().strip_prefix("bytes=") {
+                            Some(spec) => spec,
+                            None => continue,
+                        };
+                        let parts: Vec<&str> = spec.split('-').collect();
+                        if parts.len() != 2 {
+                            continue;
+                        }
+                        start = parts[0].trim().parse().unwrap_or(0);
+                        end = if parts[1].trim().is_empty() {
+                            total.saturating_sub(1)
+                        } else {
+                            parts[1].trim().parse().unwrap_or(total.saturating_sub(1))
+                        };
+                        partial = true;
+                    }
+
+                    let end = end.min(total.saturating_sub(1));
+                    let slice = if total == 0 {
+                        &body[0..0]
+                    } else {
+                        &body[start..=end]
+                    };
+                    let header = if partial {
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                            slice.len(), start, end, total
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        )
+                    };
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(slice).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        format!("http://127.0.0.1:{}/file.bin", port)
+    }
+
+    /// 断点续传的核心保证：分片文件里已落盘的字节会被复用，
+    /// 续传后拼出来的内容必须与原始文件逐字节一致（错位合并会在这里被抓到）
+    #[tokio::test]
+    async fn download_segment_resumes_from_existing_bytes() {
+        // 与暂停/取消相关测试串行：它们会改全局暂停标志与 epoch，并发跑会互相干扰
+        let _serial = PAUSE_TEST_LOCK.lock().await;
+        let total: usize = 300_000;
+        let body: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let hits = Arc::new(AtomicU64::new(0));
+        let url = spawn_range_server(body.clone(), Arc::clone(&hits)).await;
+
+        let dir = unique_temp_dir("segment-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = build_client().unwrap();
+        let epoch = DOWNLOAD_EPOCH.load(Ordering::SeqCst);
+        let task = "test-resume";
+
+        // 1) 首次：完整下载一个分片
+        let chunk = dir.join("chunk_0");
+        let progress = Arc::new(AtomicU64::new(0));
+        let last = (total - 1) as u64;
+        download_segment_once(&client, &url, "", &chunk, 0, last, &progress, epoch, task)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&chunk).unwrap(), body);
+        assert_eq!(progress.load(Ordering::Relaxed), total as u64);
+
+        // 2) 已经完整：直接返回，不再打扰 CDN
+        let hits_before = hits.load(Ordering::SeqCst);
+        download_segment_once(&client, &url, "", &chunk, 0, last, &progress, epoch, task)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            hits_before,
+            "已完整的分片不应重复下载"
+        );
+
+        // 3) 模拟「下到一半应用被杀」：截断尾部后继续
+        let file = std::fs::OpenOptions::new().write(true).open(&chunk).unwrap();
+        file.set_len(total as u64 - 1000).unwrap();
+        drop(file);
+        progress.store(0, Ordering::Relaxed);
+        download_segment_once(&client, &url, "", &chunk, 0, last, &progress, epoch, task)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&chunk).unwrap(),
+            body,
+            "续传后内容必须与原始文件逐字节一致"
+        );
+        assert_eq!(progress.load(Ordering::Relaxed), total as u64);
+
+        // 4) 分片文件比区间还长（上一次运行的残留对不上）：丢弃重下，不得错位合并
+        let file = std::fs::OpenOptions::new().write(true).open(&chunk).unwrap();
+        file.set_len(total as u64 + 10).unwrap();
+        drop(file);
+        download_segment_once(&client, &url, "", &chunk, 0, last, &progress, epoch, task)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&chunk).unwrap(), body);
+
+        // 5) 中间分片（start != 0）：截断后继续，拼接结果仍对应原始区间
+        let (start, end) = (50_000u64, 99_999u64);
+        let chunk2 = dir.join("chunk_1");
+        let progress2 = Arc::new(AtomicU64::new(0));
+        download_segment_once(&client, &url, "", &chunk2, start, end, &progress2, epoch, task)
+            .await
+            .unwrap();
+        let expected = body[start as usize..=end as usize].to_vec();
+        assert_eq!(std::fs::read(&chunk2).unwrap(), expected);
+
+        let file = std::fs::OpenOptions::new().write(true).open(&chunk2).unwrap();
+        file.set_len(end - start + 1 - 500).unwrap();
+        drop(file);
+        download_segment_once(&client, &url, "", &chunk2, start, end, &progress2, epoch, task)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&chunk2).unwrap(), expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useQuarkStore, isTaskFinished } from '../../store/useQuarkStore';
+import type { DownloadTask } from '../../store/useQuarkStore';
 import { getErrorMessage } from '../../utils';
+import { runDownloadBatch } from './downloadBatch';
 
 // 流水线里「还没结束」的三个阶段，终态（done/failed/cancelled）不走这里
 type PipelinePhase = 'transferring' | 'preparing' | 'downloading';
@@ -203,6 +205,33 @@ export const pauseTask = async (id: string): Promise<boolean> => {
     return true;
 };
 
+// 任务是否有活的调度记录：重启后从本地缓存恢复的「已暂停」任务一条都没有，
+// 它们的「继续」不能走闸门放行那条路（没有流水线可放行），必须重新起一条续传流水线
+const hasLiveSchedulerState = (id: string) =>
+    pendingIds.includes(id) ||
+    runningIds.has(id) ||
+    parkedIds.has(id) ||
+    inflightIds.has(id) ||
+    pipelineIds.has(id);
+
+// 拉起一条「续传批次」：后端按 taskId 找回上次的分片目录与输出路径，从断点接着下。
+// 上下文缺失时如实标记失败，避免留下一排永远不会动的「已暂停」任务
+const startResumeBatch = (tasks: DownloadTask[]): boolean => {
+    const { addLog, updateTask, downloadContext } = useQuarkStore.getState();
+    if (!downloadContext.pwdId || !downloadContext.stoken) {
+        const message = '分享链接上下文已失效，无法继续下载，请重新解析分享链接后再下载';
+        for (const task of tasks) {
+            updateTask(task.id, { status: 'failed', error: message, speed: 0, finishedAt: Date.now() });
+        }
+        addLog(message, 'error');
+        return false;
+    }
+
+    addLog(`继续下载：${tasks.length} 个任务从断点续传`, 'info');
+    void runDownloadBatch({ tasks, context: downloadContext, resume: true });
+    return true;
+};
+
 // 继续单个任务：在下载阶段先恢复后端任务，再放行前端闸门
 export const resumeTask = async (id: string): Promise<boolean> => {
     const { updateTask, addLog } = useQuarkStore.getState();
@@ -213,6 +242,17 @@ export const resumeTask = async (id: string): Promise<boolean> => {
     if (isBatchPaused()) {
         addLog('全局暂停中，已改为恢复全部下载', 'warn');
         return resumeAllTasks();
+    }
+
+    // 没有任何活的调度记录：重启后从本地缓存恢复的任务属于这种情况，
+    // 它们没有流水线可以「放行」，只能重新起一条续传流水线
+    if (!hasLiveSchedulerState(id)) {
+        if (batchState.running) {
+            // 已有别的批次在跑：runDownloadBatch 不接受第二个并发批次
+            addLog(`已有任务正在下载，请等这一批结束后再继续: ${task.filename}`, 'warn');
+            return false;
+        }
+        return startResumeBatch([task]);
     }
 
     const inflight = inflightIds.has(id);
@@ -293,6 +333,9 @@ const parkAllTasks = () => {
     const { downloadTasks, updateTask } = useQuarkStore.getState();
     for (const task of downloadTasks) {
         if (isTaskFinished(task.status)) continue;
+        // 不属于本批次的任务（例如重启后恢复、还没点继续的）不参与批次暂停：
+        // 它们没有流水线，park 进来只会在「全部继续」时变成占着并发额度的幽灵任务
+        if (!hasLiveSchedulerState(task.id)) continue;
         parkedIds.add(task.id);
         runningIds.delete(task.id);
         updateTask(task.id, { status: 'paused', speed: 0 });
@@ -351,6 +394,14 @@ export const pauseAllTasks = async (): Promise<boolean> => {
 // 没有全局暂停时退化为「继续所有被单独暂停的行」，与下载管理页按钮的可用条件保持一致
 export const resumeAllTasks = async (): Promise<boolean> => {
     const { addLog } = useQuarkStore.getState();
+
+    // 重启后恢复的任务没有活的批次：整批按续传重新拉起（单个任务的「继续」走 resumeTask）
+    if (!batchState.running) {
+        const pausedTasks = useQuarkStore.getState().downloadTasks
+            .filter((task) => task.status === 'paused');
+        if (pausedTasks.length === 0) return false;
+        return startResumeBatch(pausedTasks);
+    }
 
     if (!isBatchPaused()) {
         const pausedIds = useQuarkStore.getState().downloadTasks
@@ -414,10 +465,21 @@ export const requestBatchCancel = () => {
 // 取消全部：批次标记 + 清空待派发队列 + 放行所有闸门，
 // 已经在下载的任务由后端 cancel_downloads 结束（各自的 download_file 会以「已取消」拒绝）
 export const cancelAllTasks = async (): Promise<void> => {
-    const { addLog, setDownloading } = useQuarkStore.getState();
+    const { addLog, setDownloading, downloadTasks, updateTask } = useQuarkStore.getState();
     // 取消会结束任务：后端也会清掉暂停标志，前端同步复位
     setBatchPaused(false);
     addLog('已请求取消全部下载...', 'warn');
+
+    // 重启后恢复的任务没有活的批次：后端不认识这些 taskId，本地直接收尾
+    if (!batchState.running) {
+        for (const task of downloadTasks) {
+            if (isTaskFinished(task.status)) continue;
+            updateTask(task.id, { status: 'cancelled', speed: 0, finishedAt: Date.now() });
+        }
+        setDownloading(false);
+        return;
+    }
+
     requestBatchCancel();
 
     try {
