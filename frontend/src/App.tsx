@@ -6,6 +6,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useQuarkStore, isTaskFinished } from './store/useQuarkStore';
 import { quarkApi } from './services/quarkApi';
 import { ShareParser } from './features/share-parse/ShareParser';
+import { ShareLinkBar } from './features/share-parse/ShareLinkBar';
 import { HelpView } from './features/help/HelpView';
 import { FileTree } from './features/file-tree/FileTree';
 import { HistoryView } from './features/history/HistoryView';
@@ -31,7 +32,7 @@ function App() {
     isLoggedIn,
     setCapacity,
     setCapacityLoading,
-    shareInfo,
+    shares,
     restorePendingDownloads,
     updateTask,
     loadSettings,
@@ -57,22 +58,25 @@ function App() {
 
     if (!restored || restoredTasks.length === 0) return;
 
-    const { pwdId, stoken } = restored.context;
-    if (!pwdId || !stoken) {
-      // 分享上下文缺失（例如本地缓存被清理过）：没有直链可用，续传不可能成功。
-      // 如实标记为失败，而不是留下一行假装「已暂停」却永远不会动的任务
-      const message = '分享链接上下文已失效，无法继续下载，请重新解析分享链接后再下载';
-      restoredTasks.forEach((task) => {
-        updateTask(task.id, { status: 'failed', error: message, speed: 0, finishedAt: Date.now() });
-      });
-      useQuarkStore.getState().notify(message, 'warn');
-      return;
-    }
+    // 多链接后分享上下文挂在每个任务上：逐条校验。
+    // 缺上下文的任务（例如本地缓存被清理过）没有直链可用，续传不可能成功，
+    // 如实标记为失败，而不是留下一行假装「已暂停」却永远不会动的任务。
+    const invalidMessage = '分享链接上下文已失效，无法继续下载，请重新解析分享链接后再下载';
+    const invalidTasks = restoredTasks.filter((task) => !task.pwdId || !task.stoken);
+    const restorableCount = restoredTasks.length - invalidTasks.length;
 
-    useQuarkStore.getState().notify(
-      `已恢复 ${restoredTasks.length} 个未完成的下载任务（已暂停），可在「下载管理」里继续`,
-      'info'
-    );
+    invalidTasks.forEach((task) => {
+      updateTask(task.id, { status: 'failed', error: invalidMessage, speed: 0, finishedAt: Date.now() });
+    });
+
+    if (restorableCount > 0) {
+      useQuarkStore.getState().notify(
+        `已恢复 ${restorableCount} 个未完成的下载任务（已暂停），可在「下载管理」里继续`,
+        'info'
+      );
+    } else {
+      useQuarkStore.getState().notify(invalidMessage, 'warn');
+    }
   }, [restorePendingDownloads, updateTask]);
 
   // 下载目录等设置：App 启动就拉一次，设置页与下载相关展示都依赖它
@@ -184,13 +188,15 @@ function App() {
             {/* Dynamic Results Area */}
             <div className="flex-1 flex flex-col min-h-0">
               <AnimatePresence mode="popLayout" initial={false}>
-                {shareInfo.files.length > 0 ? (
+                {shares.length > 0 ? (
                   <motion.div
                     key="results-area"
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
-                    className="flex-1 min-h-0"
+                    className="flex-1 min-h-0 flex flex-col gap-3"
                   >
+                    {/* 多链接标签条：切换链接 / 删除链接 / 查看跨链接选择汇总 */}
+                    <ShareLinkBar />
                     <FileTree />
                   </motion.div>
                 ) : (

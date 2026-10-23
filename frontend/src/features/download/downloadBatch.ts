@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useQuarkStore } from '../../store/useQuarkStore';
-import type { DownloadBatchContext, DownloadTask, LogEntry } from '../../store/useQuarkStore';
+import type { DownloadTask, LogEntry } from '../../store/useQuarkStore';
 import { quarkApi } from '../../services/quarkApi';
 import { getErrorMessage, sleep } from '../../utils';
 import {
@@ -21,7 +21,6 @@ import {
 
 export interface DownloadBatchRequest {
     tasks: DownloadTask[];
-    context: DownloadBatchContext;
     /** true = 续传：后端复用上次遗留的分片文件，从断点接着下 */
     resume?: boolean;
 }
@@ -34,7 +33,6 @@ type TaskOutcome = 'done' | 'failed' | 'cancelled';
 // 重启后的「继续下载」也复用同一个入口，只是把 resume 置为 true。
 export const runDownloadBatch = async ({
     tasks,
-    context,
     resume = false,
 }: DownloadBatchRequest): Promise<void> => {
     if (batchState.running) {
@@ -45,8 +43,6 @@ export const runDownloadBatch = async ({
 
     const store = () => useQuarkStore.getState();
     const addLog = (message: string, type: LogEntry['type'] = 'info') => store().addLog(message, type);
-    const { pwdId, stoken } = context;
-    const tokenByFid = new Map(Object.entries(context.tokenByFid));
     const downloadThreads = store().downloadThreads;
 
     batchState.running = true;
@@ -88,16 +84,22 @@ export const runDownloadBatch = async ({
         let savedFid: string | null = null;
 
         try {
+            // 分享上下文跟着任务走（一个批次可能跨多条链接）：缺失就没法转存，
+            // 直接给出可读错误，交给外层 catch 标记 failed，不要静默失败
+            if (!task.pwdId || !task.stoken) {
+                throw new Error('分享链接上下文已失效，请重新解析该链接');
+            }
+
             addLog(`${label} 正在处理: ${task.filename}`);
             setTaskPhase(id, 'transferring');
             store().updateTask(id, { startedAt: Date.now(), error: undefined });
 
             addLog('  正在转存到网盘...');
             const sr = await quarkApi.saveFiles(
-                pwdId,
-                stoken,
+                task.pwdId,
+                task.stoken,
                 [task.fid],
-                [tokenByFid.get(task.fid) ?? '']
+                [task.shareFidToken ?? '']
             );
 
             if (sr.status !== 200 || !sr.data) {

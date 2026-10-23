@@ -12,10 +12,17 @@ import { motion, AnimatePresence } from 'framer-motion';
 
 type ParseProgressReporter = (list: RawFileItem[], depth: number, page: number) => void;
 
+// 本次输入的解析进度：多条链接可以同时保留在列表里，
+// 进度文案只属于「当前这一次解析」，因此放组件本地 state，不写进任何一条链接的状态里
+interface ParseStatus {
+    text: string;
+    type: 'info' | 'success' | 'error' | 'warn';
+}
+
 const isDirectory = (item: RawFileItem) => item.dir || item.file_type === 0 || item.obj_category === 'dir';
 
 // 解析状态文案配色，按 statusType 选择
-const STATUS_TEXT_CLASS: Record<'info' | 'success' | 'error' | 'warn', string> = {
+const STATUS_TEXT_CLASS: Record<ParseStatus['type'], string> = {
     info: 'text-slate-500',
     success: 'text-emerald-600',
     error: 'text-rose-500',
@@ -26,13 +33,12 @@ export const ShareParser: React.FC = () => {
     const [url, setUrl] = useState('');
     const {
         cookie,
-        setShareInfo,
-        resetShareInfo,
+        shares,
+        selectedKeys,
+        upsertShare,
+        updateShare,
         addLog,
         notify,
-        shareInfo,
-        selectedFids,
-        setShareUrl,
         addHistory,
         pendingParseUrl,
         clearPendingParse
@@ -41,10 +47,12 @@ export const ShareParser: React.FC = () => {
     // 面板显式开关状态：按钮随时可切换，选中文件时自动展开
     const [panelOpen, setPanelOpen] = useState(false);
     const [showSuccessPulse, setShowSuccessPulse] = useState(false);
+    const [parseStatus, setParseStatus] = useState<ParseStatus | null>(null);
 
-    const isParsed = shareInfo.allFiles.length > 0;
+    // 已解析任意一条链接就算「已解析」：多链接是追加式的，不会因为再次输入而清空
+    const isParsed = shares.length > 0;
 
-    const prevSelectedSize = useRef(selectedFids.size);
+    const prevSelectedSize = useRef(selectedKeys.size);
     // 解析重入保护：Enter 键路径会绕过按钮的 disabled
     const parseInFlightRef = useRef(false);
 
@@ -125,14 +133,30 @@ export const ShareParser: React.FC = () => {
         if (!targetUrl) return;
         if (!cookie) {
             const message = '请先登录账号';
-            setShareInfo({ status: message, statusType: 'warn' });
+            setParseStatus({ text: message, type: 'warn' });
             notify(message, 'warn');
             return;
         }
+
+        const { pwdId, passcode, pdirFid } = parseShareUrl(targetUrl);
+        if (!pwdId) {
+            const message = '无法从链接中提取分享 ID';
+            setParseStatus({ text: `解析失败: ${message}`, type: 'error' });
+            addLog(`解析失败: ${message}`, 'error');
+            notify(`解析失败: ${message}`, 'error');
+            return;
+        }
+
+        // 同一条链接（pwdId 相同）再次解析：先标记为解析中，成功后原地更新，失败也只影响它自己
+        const isRefresh = shares.some((share) => share.id === pwdId);
+        if (isRefresh) {
+            updateShare(pwdId, { parsing: true, status: '正在重新解析...', statusType: 'info' });
+        }
+
         parseInFlightRef.current = true;
         setLoading(true);
-        resetShareInfo();
         setShowSuccessPulse(false);
+        setParseStatus({ text: isRefresh ? '正在重新解析...' : '正在获取访问令牌...', type: 'info' });
         addLog(`开始解析: ${targetUrl.substring(0, 50)}...`);
 
         const parseStats = {
@@ -156,7 +180,7 @@ export const ShareParser: React.FC = () => {
             parseStats.scannedDirs += dirCount;
 
             const message = `解析中：已扫描 ${parseStats.scannedItems} 项（文件 ${parseStats.scannedFiles}，目录 ${parseStats.scannedDirs}）`;
-            setShareInfo({ status: message, statusType: 'info' });
+            setParseStatus({ text: message, type: 'info' });
 
             const now = Date.now();
             const shouldNotify = now - parseStats.lastToastAt > 1000 || depth === 0 || page === 1;
@@ -167,10 +191,6 @@ export const ShareParser: React.FC = () => {
         };
 
         try {
-            const { pwdId, passcode, pdirFid } = parseShareUrl(targetUrl);
-            if (!pwdId) throw new Error('无法从链接中提取分享 ID');
-
-            setShareInfo({ status: '正在获取访问令牌...', statusType: 'info' });
             notify('正在获取访问令牌...', 'info');
             const resToken = await quarkApi.getShareToken(pwdId, passcode);
             if (!resToken.data?.stoken) throw new Error(resToken.message || '获取访问令牌失败');
@@ -180,14 +200,17 @@ export const ShareParser: React.FC = () => {
             const files = await getFileTreeRecursive(pwdId, stoken, pdirFid, 0, '', reportParseProgress);
             const allFiles = collectFiles(files);
 
-            setShareInfo({
+            // 追加式写入：id 用 pwdId，同链接原地更新；已解析的其它链接完全不受影响
+            upsertShare({
+                id: pwdId,
                 pwdId,
                 stoken,
                 shareUrl: targetUrl,
                 files,
-                allFiles,
                 status: `解析完成，共 ${allFiles.length} 个文件`,
-                statusType: 'success'
+                statusType: 'success',
+                parsing: false,
+                parsedAt: Date.now(),
             });
             // 解析成功才写入历史：文件数 / 目录数（递归）/ 总大小，pwdId 相同则覆盖旧记录
             addHistory({
@@ -200,11 +223,27 @@ export const ShareParser: React.FC = () => {
                 parsedAt: Date.now(),
             });
             setShowSuccessPulse(true);
+            // 清空输入框，方便直接粘贴下一条链接（已解析的链接保留在链接条里）；
+            // 解析期间用户若已经粘贴了下一条，就不要把新内容一起抹掉
+            setUrl((current) => (current.trim() === targetUrl ? '' : current));
+            const linkCount = isRefresh ? shares.length : shares.length + 1;
+            setParseStatus({
+                text: `解析完成，共 ${allFiles.length} 个文件 · 已保留 ${linkCount} 条链接，可继续粘贴下一条`,
+                type: 'success',
+            });
             notify(`解析成功，发现 ${allFiles.length} 个文件`, 'success');
             addLog(`解析成功，发现 ${allFiles.length} 个文件`, 'success');
         } catch (err: unknown) {
             const message = getErrorMessage(err);
-            setShareInfo({ status: `解析失败: ${message}`, statusType: 'error' });
+            // 失败只落在本地状态与（若已存在）该链接自己的状态上，其它链接继续可用
+            setParseStatus({ text: `解析失败: ${message}`, type: 'error' });
+            if (isRefresh) {
+                updateShare(pwdId, {
+                    parsing: false,
+                    status: `解析失败: ${message}`,
+                    statusType: 'error',
+                });
+            }
             addLog(`解析失败: ${message}`, 'error');
             notify(`解析失败: ${message}`, 'error');
         } finally {
@@ -213,23 +252,20 @@ export const ShareParser: React.FC = () => {
         }
     };
 
+    // 选择是按全部链接汇总的：跨链接选中任意文件时就展开面板，清空选择时自动收起
     useEffect(() => {
-        if (prevSelectedSize.current === 0 && selectedFids.size > 0) {
-            // 首次选中文件时自动展开面板
+        if (prevSelectedSize.current === 0 && selectedKeys.size > 0) {
             setPanelOpen(true);
-        } else if (selectedFids.size === 0 && prevSelectedSize.current > 0) {
-            // 清空选择时自动收起
+        } else if (selectedKeys.size === 0 && prevSelectedSize.current > 0) {
             setPanelOpen(false);
         }
-        prevSelectedSize.current = selectedFids.size;
-    }, [selectedFids.size]);
+        prevSelectedSize.current = selectedKeys.size;
+    }, [selectedKeys.size]);
 
-    // 初始化时从 store 恢复 URL
+    // 链接被全部移除后没有可下载内容：把悬浮面板一并收起，避免留下一个空面板
     useEffect(() => {
-        if (shareInfo.shareUrl && !url) {
-            setUrl(shareInfo.shareUrl);
-        }
-    }, [shareInfo.shareUrl, url]);
+        if (shares.length === 0) setPanelOpen(false);
+    }, [shares.length]);
 
     // handleParse 每次渲染都会重建，用 ref 保存最新引用：一键重新解析的 effect
     // 因此无需把整段解析逻辑塞进依赖数组，也不会读到过期的 loading / cookie
@@ -245,16 +281,9 @@ export const ShareParser: React.FC = () => {
         if (loading || parseInFlightRef.current) return;
 
         setUrl(pendingParseUrl);
-        setShareUrl(pendingParseUrl);
         clearPendingParse();
         void handleParseRef.current(pendingParseUrl);
-    }, [pendingParseUrl, loading, setShareUrl, clearPendingParse]);
-
-    // 输入时同步到 store
-    const handleUrlChange = (newUrl: string) => {
-        setUrl(newUrl);
-        setShareUrl(newUrl);
-    };
+    }, [pendingParseUrl, loading, clearPendingParse]);
 
     return (
         <div className="relative">
@@ -266,8 +295,8 @@ export const ShareParser: React.FC = () => {
                     </div>
                     <Input
                         value={url}
-                        onChange={(e) => handleUrlChange(e.target.value)}
-                        placeholder="粘贴夸克网盘分享链接..."
+                        onChange={(e) => setUrl(e.target.value)}
+                        placeholder="粘贴夸克网盘分享链接，支持连续添加多条..."
                         className="border-0 bg-transparent shadow-none focus-visible:ring-0 focus-visible:bg-transparent h-14 font-medium"
                         onKeyDown={(e) => e.key === 'Enter' && handleParse()}
                     />
@@ -365,10 +394,10 @@ export const ShareParser: React.FC = () => {
                     </div>
                 </SearchContainer>
 
-                {/* 解析状态：之前只写入 store 从不显示，解析失败时用户看不到原因 */}
-                {shareInfo.status && (
-                    <div className={cn("mt-2 pl-4 text-xs font-medium", STATUS_TEXT_CLASS[shareInfo.statusType])}>
-                        {shareInfo.status}
+                {/* 本次解析的状态：多链接追加解析时，这里显示的是「这一次」的进度，失败也能看到原因 */}
+                {parseStatus && (
+                    <div className={cn("mt-2 pl-4 text-xs font-medium", STATUS_TEXT_CLASS[parseStatus.type])} title={parseStatus.text}>
+                        {parseStatus.text}
                     </div>
                 )}
 

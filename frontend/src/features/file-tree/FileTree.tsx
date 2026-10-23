@@ -11,7 +11,7 @@ import {
     FileCode,
     File as FileIcon,
 } from 'lucide-react';
-import { useQuarkStore } from '../../store/useQuarkStore';
+import { useQuarkStore, fileKey, selectActiveShare } from '../../store/useQuarkStore';
 import type { ShareFileNode } from '../../types/quark';
 import { cn, formatSize, formatTime } from '../../utils';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -39,13 +39,15 @@ const DATE_COL_CLASS = 'file-tree-date-col items-center justify-end overflow-hid
 
 interface FileRowProps {
     node: ShareFileNode;
+    /** 所属链接 id：选中键由 (shareId, fid) 组成，不同链接里的同名 fid 不会串选 */
+    shareId: string;
     expanded: boolean;
     onToggleExpand: (node: ShareFileNode) => void;
 }
 
-const FileRow: React.FC<FileRowProps> = ({ node, expanded, onToggleExpand }) => {
-    const { selectedFids, toggleFileSelection } = useQuarkStore();
-    const isSelected = selectedFids.has(node.fid);
+const FileRow: React.FC<FileRowProps> = ({ node, shareId, expanded, onToggleExpand }) => {
+    const isSelected = useQuarkStore((state) => state.selectedKeys.has(fileKey(shareId, node.fid)));
+    const toggleFileSelection = useQuarkStore((state) => state.toggleFileSelection);
     const sizeText = formatSize(node.size);
     const updatedText = node.updated_at ? formatTime(node.updated_at) : '';
     const updatedDateText = updatedText.split(' ')[0] || '';
@@ -78,7 +80,7 @@ const FileRow: React.FC<FileRowProps> = ({ node, expanded, onToggleExpand }) => 
                 <div className="w-4 shrink-0 sm:w-5">
                     <Checkbox
                         checked={isSelected}
-                        onCheckedChange={() => toggleFileSelection(node.fid)}
+                        onCheckedChange={() => toggleFileSelection(shareId, node.fid)}
                         onClick={(e) => e.stopPropagation()}
                     />
                 </div>
@@ -117,26 +119,30 @@ const FileRow: React.FC<FileRowProps> = ({ node, expanded, onToggleExpand }) => 
 };
 
 export const FileTree: React.FC = () => {
-    const { shareInfo } = useQuarkStore();
-    // 展开状态保存在组件本地，避免直接修改 shareInfo.files 里的对象（那样不会触发 zustand 更新）
+    // 多链接：这里只渲染「当前激活链接」的那棵树，切换链接即切换目录树
+    const activeShare = useQuarkStore((state) => selectActiveShare(state));
+    // 展开状态保存在组件本地，避免直接修改 store 里的树对象（那样不会触发 zustand 更新）
     const [expandedMap, setExpandedMap] = useState<Record<string, boolean>>({});
 
-    // 重新解析后是一棵全新的树，清空本地展开记录，回到解析阶段给出的默认展开状态
+    const activeShareId = activeShare?.id ?? null;
+    const files = activeShare?.files ?? null;
+
+    // 切换链接 / 重新解析后都是（另一）棵树，清空本地展开记录，回到解析阶段给出的默认展开状态
     useEffect(() => {
         setExpandedMap({});
-    }, [shareInfo.files]);
+    }, [activeShareId, files]);
 
     const toggleExpand = (node: ShareFileNode): void => {
         setExpandedMap((prev) => ({ ...prev, [node.fid]: !(prev[node.fid] ?? node.expanded) }));
     };
 
-    const renderNodes = (nodes: ShareFileNode[]) => {
+    const renderNodes = (nodes: ShareFileNode[], shareId: string) => {
         return nodes.map(node => {
             // 未手动切换过时沿用解析阶段给出的初始值（根节点默认展开）
             const expanded = expandedMap[node.fid] ?? node.expanded;
             return (
                 <React.Fragment key={node.fid}>
-                    <FileRow node={node} expanded={expanded} onToggleExpand={toggleExpand} />
+                    <FileRow node={node} shareId={shareId} expanded={expanded} onToggleExpand={toggleExpand} />
                     <AnimatePresence>
                         {node.isDir && expanded && node.children.length > 0 && (
                             <motion.div
@@ -145,7 +151,7 @@ export const FileTree: React.FC = () => {
                                 exit={{ height: 0, opacity: 0 }}
                                 className="overflow-hidden"
                             >
-                                {renderNodes(node.children)}
+                                {renderNodes(node.children, shareId)}
                             </motion.div>
                         )}
                     </AnimatePresence>
@@ -154,7 +160,7 @@ export const FileTree: React.FC = () => {
         });
     };
 
-    if (shareInfo.files.length === 0) return null;
+    if (!activeShare || !files || files.length === 0) return null;
 
     return (
         <div className="file-tree-panel glass-effect flex h-full min-h-0 flex-1 flex-col overflow-hidden rounded-[1.5rem] border-white/40">
@@ -163,18 +169,23 @@ export const FileTree: React.FC = () => {
                     <div className="w-4 shrink-0 sm:w-5" />
                     <div className="w-4 shrink-0 sm:w-5" />
                     <div className="w-[18px] shrink-0" />
-                    <div className="min-w-0 flex-1">文件列表</div>
+                    <div className="min-w-0 flex-1">
+                        文件列表
+                        <span className="ml-2 text-[10px] font-bold normal-case tracking-normal text-indigo-500/80 tabular-nums">
+                            {activeShare.allFiles.length} 个文件
+                        </span>
+                    </div>
                     <div className={SIZE_COL_CLASS}>大小</div>
                     <div className={DATE_COL_CLASS}>日期</div>
                 </div>
                 <div className="flex flex-col">
-                    {renderNodes(shareInfo.files)}
+                    {renderNodes(files, activeShare.id)}
                 </div>
             </ScrollArea>
 
             <div className="shrink-0 border-t border-white/20 bg-white/40 p-3 text-center">
                 <Badge variant="secondary" className="bg-transparent border-0 text-slate-400 font-bold">
-                    显示范围：当前根目录及所有子目录
+                    显示范围：当前链接根目录及所有子目录
                 </Badge>
             </div>
         </div>

@@ -1,10 +1,9 @@
 import React from 'react';
 import { CheckSquare, Square, Loader2, Zap, Ban, Play, Pause } from 'lucide-react';
-import { useQuarkStore } from '../../store/useQuarkStore';
-import type { DownloadBatchContext, LogEntry } from '../../store/useQuarkStore';
+import { useQuarkStore, collectSelectedFiles, fileKey, selectActiveShare } from '../../store/useQuarkStore';
+import type { LogEntry } from '../../store/useQuarkStore';
 import { formatSize, cn } from '../../utils';
 import { Button } from '../../components/ui/button';
-import type { ShareFileNode } from '../../types/quark';
 import { batchState, cancelAllTasks, pauseAllTasks, resumeAllTasks } from './taskControls';
 import { runDownloadBatch } from './downloadBatch';
 
@@ -21,10 +20,11 @@ const LOG_TYPE_CLASS: Record<LogEntry['type'], string> = {
 // 这些状态必须跨挂载保留，否则重开面板后取消/继续会失效。
 export const DownloadManager: React.FC = () => {
     const {
-        shareInfo,
-        selectedFids,
+        shares,
+        activeShareId,
+        selectedKeys,
         selectAllFiles,
-        clearSelection,
+        clearShareSelection,
         downloading,
         batchPaused,
         progress,
@@ -36,22 +36,27 @@ export const DownloadManager: React.FC = () => {
         downloadThreads,
         notify,
         createTasks,
-        setDownloadContext,
     } = useQuarkStore();
 
-    // 批次暂停状态来自 store（taskControls 维护）：下载管理页暂停后这里的按钮同步变成「继续」
-    const handleSelectAll = () => {
-        if (selectedFids.size === shareInfo.allFiles.length) {
-            clearSelection();
-        } else {
-            selectAllFiles(shareInfo.allFiles.map((f: ShareFileNode) => f.fid));
-        }
-    };
+    // 当前激活链接决定「全选」的范围；已选数量 / 大小则跨所有链接聚合统计
+    const activeShare = selectActiveShare({ shares, activeShareId });
+    const picked = collectSelectedFiles(shares, selectedKeys);
+    const selectedSize = picked.reduce((acc, { file }) => acc + file.size, 0);
+    // 选中文件来自多条链接时给出提示：用户能看出这批任务不止一条链接
+    const pickedShareCount = new Set(picked.map(({ share }) => share.id)).size;
 
-    const getSelectedSize = () => {
-        return shareInfo.allFiles
-            .filter((f: ShareFileNode) => selectedFids.has(f.fid))
-            .reduce((acc: number, f: ShareFileNode) => acc + f.size, 0);
+    // 批次暂停状态来自 store（taskControls 维护）：下载管理页暂停后这里的按钮同步变成「继续」
+    // 「全选」只对当前激活链接生效，其它链接已选中的文件保持不动
+    const handleSelectAll = () => {
+        if (!activeShare || activeShare.allFiles.length === 0) return;
+        const shareAllSelected = activeShare.allFiles.every((file) =>
+            selectedKeys.has(fileKey(activeShare.id, file.fid))
+        );
+        if (shareAllSelected) {
+            clearShareSelection(activeShare.id);
+        } else {
+            selectAllFiles(activeShare.id);
+        }
     };
 
     const handleCancel = async () => {
@@ -78,7 +83,7 @@ export const DownloadManager: React.FC = () => {
     };
 
     const startDownload = async () => {
-        if (selectedFids.size === 0) return;
+        if (selectedKeys.size === 0) return;
         if (batchState.running) {
             // 上一轮任务尚未收尾（例如取消后仍在等待后端返回）
             notify('已有任务正在进行中，请稍候', 'warn');
@@ -90,7 +95,8 @@ export const DownloadManager: React.FC = () => {
             return;
         }
 
-        const filesToDownload = shareInfo.allFiles.filter((f: ShareFileNode) => selectedFids.has(f.fid));
+        // 跨链接聚合：每个任务自带所属链接的上下文（转存的 pwdId/stoken/token 各不相同）
+        const filesToDownload = collectSelectedFiles(shares, selectedKeys);
         if (filesToDownload.length === 0) {
             addLog('没有可处理的文件', 'warn');
             notify('没有可处理的文件', 'warn');
@@ -98,31 +104,28 @@ export const DownloadManager: React.FC = () => {
         }
 
         // 每个文件一条任务行：id 由前端生成，逐个暂停/继续/取消与进度事件都用它寻址
-        const tasks = createTasks(filesToDownload.map((f: ShareFileNode) => ({
-            fid: f.fid,
-            file_name: f.file_name,
-            size: f.size,
+        // 分享上下文写在 task 上（随未完成队列落盘），重启后据此恢复队列并续传
+        const tasks = createTasks(filesToDownload.map(({ share, file }) => ({
+            shareId: share.id,
+            pwdId: share.pwdId,
+            stoken: share.stoken,
+            shareUrl: share.shareUrl,
+            fid: file.fid,
+            file_name: file.file_name,
+            size: file.size,
+            shareFidToken: file.share_fid_token,
         })));
 
-        // 批次上下文（分享标识 / stoken / 转存 token）一并写进 store：它会被持久化，
-        // 应用被关闭后重启时据此恢复队列并续传（真正的断点续传在后端按 taskId 找回分片）
-        const context: DownloadBatchContext = {
-            pwdId: shareInfo.pwdId,
-            stoken: shareInfo.stoken,
-            shareUrl: shareInfo.shareUrl,
-            tokenByFid: Object.fromEntries(
-                filesToDownload.map((f: ShareFileNode) => [f.fid, f.share_fid_token])
-            ),
-        };
-        setDownloadContext(context);
-
         // 流水线放在 downloadBatch：下载面板被卸载后任务照样继续跑
-        await runDownloadBatch({ tasks, context });
+        await runDownloadBatch({ tasks });
     };
 
-    if (shareInfo.files.length === 0) return null;
+    // 一条链接都没有时没有可下载的内容；解析中/空目录的链接仍然保留面板
+    if (shares.length === 0) return null;
 
-    const isAllSelected = selectedFids.size === shareInfo.allFiles.length && shareInfo.allFiles.length > 0;
+    const isAllSelected = !!activeShare
+        && activeShare.allFiles.length > 0
+        && activeShare.allFiles.every((file) => selectedKeys.has(fileKey(activeShare.id, file.fid)));
 
     return (
         <div className="shrink-0">
@@ -145,10 +148,18 @@ export const DownloadManager: React.FC = () => {
                     <div className="flex items-center gap-2.5 text-xs font-bold text-slate-700 whitespace-nowrap">
                         <span className="text-slate-400 font-medium text-[9px] uppercase tracking-tighter">已选</span>
                         <span className="flex items-center gap-2">
-                            <span className="text-[13px]">{selectedFids.size}</span>
+                            <span className="text-[13px]">{picked.length}</span>
                             <span className="text-indigo-600 font-black text-[10px] bg-indigo-50 px-2 py-0.5 rounded-md border border-indigo-100/30">
-                                {formatSize(getSelectedSize())}
+                                {formatSize(selectedSize)}
                             </span>
+                            {pickedShareCount > 1 && (
+                                <span
+                                    title={`已选文件来自 ${pickedShareCount} 条分享链接，将合并为一个批次下载`}
+                                    className="text-[9px] font-bold text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded-md border border-amber-100/50"
+                                >
+                                    跨 {pickedShareCount} 条链接
+                                </span>
+                            )}
                         </span>
                     </div>
                 </div>
@@ -187,7 +198,7 @@ export const DownloadManager: React.FC = () => {
 
                     <Button
                         onClick={startDownload}
-                        disabled={selectedFids.size === 0 || downloading}
+                        disabled={picked.length === 0 || downloading}
                         variant="gradient"
                         className="px-6 h-9 rounded-lg text-[11px] font-bold flex items-center gap-2 shadow-sm active:scale-95 transition-transform"
                     >

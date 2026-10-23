@@ -215,20 +215,31 @@ const hasLiveSchedulerState = (id: string) =>
     pipelineIds.has(id);
 
 // 拉起一条「续传批次」：后端按 taskId 找回上次的分片目录与输出路径，从断点接着下。
-// 上下文缺失时如实标记失败，避免留下一排永远不会动的「已暂停」任务
+// 分享上下文挂在每个任务上（一个批次可跨多条链接）：逐条校验，缺失的就地判失败，
+// 有可用任务才拉起续传，避免留下一排永远不会动的「已暂停」任务
 const startResumeBatch = (tasks: DownloadTask[]): boolean => {
-    const { addLog, updateTask, downloadContext } = useQuarkStore.getState();
-    if (!downloadContext.pwdId || !downloadContext.stoken) {
-        const message = '分享链接上下文已失效，无法继续下载，请重新解析分享链接后再下载';
-        for (const task of tasks) {
+    const { addLog, updateTask } = useQuarkStore.getState();
+    const message = '分享链接上下文已失效，无法继续下载，请重新解析分享链接后再下载';
+    const validTasks: DownloadTask[] = [];
+
+    for (const task of tasks) {
+        if (!task.pwdId || !task.stoken) {
             updateTask(task.id, { status: 'failed', error: message, speed: 0, finishedAt: Date.now() });
+            continue;
         }
-        addLog(message, 'error');
-        return false;
+        validTasks.push(task);
     }
 
-    addLog(`继续下载：${tasks.length} 个任务从断点续传`, 'info');
-    void runDownloadBatch({ tasks, context: downloadContext, resume: true });
+    if (validTasks.length === 0) {
+        if (tasks.length > 0) addLog(message, 'error');
+        return false;
+    }
+    if (validTasks.length < tasks.length) {
+        addLog(`有 ${tasks.length - validTasks.length} 个任务因分享链接上下文已失效被跳过，请重新解析对应链接`, 'warn');
+    }
+
+    addLog(`继续下载：${validTasks.length} 个任务从断点续传`, 'info');
+    void runDownloadBatch({ tasks: validTasks, resume: true });
     return true;
 };
 
