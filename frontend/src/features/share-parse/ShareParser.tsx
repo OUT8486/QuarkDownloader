@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Loader2, Link2, ChevronUp, Sparkles, Zap } from 'lucide-react';
+import { Loader2, Link2, ChevronUp, CloudDownload, Zap } from 'lucide-react';
 import { useQuarkStore } from '../../store/useQuarkStore';
 import { quarkApi, parseShareUrl, collectFiles, countDirs } from '../../services/quarkApi';
 import type { RawFileItem, ShareFileNode } from '../../types/quark';
@@ -357,6 +357,8 @@ export const ShareParser: React.FC = () => {
                                         whileHover={{ scale: 1.05 }}
                                         whileTap={{ scale: 0.95 }}
                                         onClick={() => setPanelOpen((open) => !open)}
+                                        title={panelOpen ? '收起下载面板' : '打开下载面板'}
+                                        aria-label={panelOpen ? '收起下载面板' : '打开下载面板'}
                                         className={cn(
                                             "relative z-10 w-12 h-12 flex items-center justify-center rounded-xl shadow-sm transition-all duration-500",
                                             panelOpen ? "shadow-indigo-200 shadow-lg" : "hover:bg-indigo-200/50"
@@ -364,6 +366,12 @@ export const ShareParser: React.FC = () => {
                                         // 强制通过 style 设置颜色，防止 tailwind 类冲突
                                         style={{ color: panelOpen ? '#ffffff' : '#4f46e5' }}
                                     >
+                                        {/* 已选数量角标：面板收起时也能看到跨链接累计选了多少 */}
+                                        {selectedKeys.size > 0 && (
+                                            <span className="absolute -right-1 -top-1 z-20 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-indigo-600 px-1 text-[10px] font-black text-white shadow ring-2 ring-white">
+                                                {selectedKeys.size > 99 ? '99+' : selectedKeys.size}
+                                            </span>
+                                        )}
                                         <AnimatePresence mode="wait">
                                             <motion.div
                                                 key={panelOpen ? "open" : "closed"}
@@ -383,7 +391,7 @@ export const ShareParser: React.FC = () => {
                                                 {panelOpen ? (
                                                     <ChevronUp size={22} className="rotate-180" />
                                                 ) : (
-                                                    <Sparkles size={22} fill="currentColor" />
+                                                    <CloudDownload size={22} />
                                                 )}
                                             </motion.div>
                                         </AnimatePresence>
@@ -404,16 +412,13 @@ export const ShareParser: React.FC = () => {
                 <AnimatePresence>
                     {panelOpen && (
                         <motion.div
-                            initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                            animate={{ opacity: 1, y: -14, scale: 1 }}
-                            exit={{ opacity: 0, y: 10, scale: 0.95 }}
-                            transition={{ type: 'spring', damping: 20, stiffness: 300 }}
-                            className="absolute bottom-full right-0 z-50 pointer-events-none pb-2"
+                            initial={{ opacity: 0, y: 16, scale: 0.97 }}
+                            animate={{ opacity: 1, y: 0, scale: 1 }}
+                            exit={{ opacity: 0, y: 16, scale: 0.97 }}
+                            transition={{ type: 'spring', damping: 26, stiffness: 320 }}
+                            className="fixed bottom-6 right-6 z-[60] origin-bottom-right"
                         >
-                            <div className="glass-effect !bg-white/95 !backdrop-blur-3xl rounded-[1.5rem] p-1.5 shadow-[0_30px_70px_-10px_rgba(0,0,0,0.3)] ring-1 ring-black/[0.08] border-white/80 pointer-events-auto inline-block min-w-max">
-                                <DownloadManager />
-                            </div>
-                            <div className="absolute -bottom-1 right-5 w-4 h-4 bg-white/95 rotate-45 border-r border-b border-black/[0.03]" />
+                            <DownloadManager onClose={() => setPanelOpen(false)} />
                         </motion.div>
                     )}
                 </AnimatePresence>
