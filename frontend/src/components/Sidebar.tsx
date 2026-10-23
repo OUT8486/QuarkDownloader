@@ -50,12 +50,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <div className="w-10 h-10 gradient-bg rounded-2xl flex items-center justify-center text-white shadow-lg shadow-purple-200/50">
                     <HardDrive size={22} strokeWidth={2.5} />
                 </div>
-                <div className="flex flex-col">
-                    <span className="font-display text-base font-medium tracking-tight text-slate-800 leading-none">
-                        Quark
-                    </span>
-                    <span className="font-display text-xs font-medium tracking-wide text-slate-500">
-                        Downloader Pro
+                <div className="flex flex-col justify-center">
+                    <span className="font-display text-base font-medium tracking-tight text-slate-800 leading-none whitespace-nowrap">
+                        QuarkDownload
                     </span>
                 </div>
             </div>

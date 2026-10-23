@@ -16,7 +16,9 @@ tauri-build = { version = "2", features = [] }
 # 自定义（非插件）命令会完全绕过 ACL 检查，远程来源可直接 invoke
 # `download_file`（参数含 url 与 filename），配合任意导航即构成任意文件写入。
 # 升级后请执行一次 `cargo build`（或 `cargo update -p tauri`）刷新 Cargo.lock。
-tauri = { version = "2.11.1", features = [] }
+# tray-icon：系统托盘（关闭窗口后进程常驻、托盘菜单退出）。
+# tauri 2.12.2 / tray-icon 0.25.1 已在 Cargo.lock 中，只是之前未启用该 feature。
+tauri = { version = "2.11.1", features = ["tray-icon"] }
 tauri-plugin-os = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

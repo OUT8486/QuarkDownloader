@@ -278,7 +278,7 @@ export const SettingsView: React.FC = () => {
                                 <span className="text-[10px] font-bold text-slate-400 uppercase">下载线程</span>
                                 <input
                                     type="number"
-                                    min="1" max="64"
+                                    min="1" max="128"
                                     value={downloadThreads}
                                     onChange={(e) => useQuarkStore.getState().setDownloadThreads(Number(e.target.value))}
                                     className="w-14 text-right text-xs font-black text-indigo-500 bg-transparent outline-none border-b border-indigo-200 focus:border-indigo-500 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
@@ -286,12 +286,12 @@ export const SettingsView: React.FC = () => {
                             </div>
                             <input
                                 type="range"
-                                min="1" max="64"
+                                min="1" max="128"
                                 value={downloadThreads}
                                 onChange={(e) => useQuarkStore.getState().setDownloadThreads(Number(e.target.value))}
                                 className="w-full h-1 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-500"
                             />
-                            <p className="mt-2 text-[11px] text-slate-400 font-medium">单个文件的分片线程数，范围 1-64，默认 16</p>
+                            <p className="mt-2 text-[11px] text-slate-400 font-medium">单个文件的分片线程数，范围 1-128，默认 16</p>
                         </div>
 
                         <div className="p-4 bg-slate-50/70 rounded-2xl border border-slate-100">

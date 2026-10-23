@@ -29,7 +29,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tauri::{Emitter, Manager};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 use tokio::io::AsyncWriteExt;
 
 /// 全局下载代际计数器（epoch）。
@@ -129,8 +131,8 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 const MIN_MULTITHREAD_SIZE: u64 = 10 * 1024 * 1024; // 10MB 以下走单线程
 /// 每文件默认分片线程数（与前端滑块默认值保持一致）
 const DEFAULT_THREADS: usize = 16;
-/// 每文件最大分片线程数（与前端滑块上限保持一致）
-const MAX_THREADS: usize = 64;
+/// 每文件最大分片线程数（与前端滑块上限保持一致，上限 128）
+const MAX_THREADS: usize = 128;
 /// 单个分片的最大重试次数
 const SEGMENT_MAX_ATTEMPTS: u32 = 3;
 
@@ -717,7 +719,7 @@ async fn download_file(
     task_id: Option<String>,
     resume: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    // 线程数：1..=64（与前端滑块/数字框一致）
+    // 线程数：1..=128（与前端滑块/数字框一致）
     let thread_count = thread_count.unwrap_or(DEFAULT_THREADS).clamp(1, MAX_THREADS);
 
     // 任务 id：优先用前端传入的（下载管理要按行控制），否则自己生成一个
@@ -1483,6 +1485,67 @@ fn show_fatal_dialog(title: &str, text: &str) {
     log_err!("[fatal] {}: {}", title, text);
 }
 
+/// 把主窗口从“托盘隐藏/最小化”状态拉回前台。
+/// 主窗口是 setup 里手动创建的，id 固定为 "main"。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// 创建系统托盘图标（任务栏右下角），并保证它活到进程结束。
+///
+/// Tauri v2 的 `TrayIcon` 是引用计数句柄：最后一个句柄被 drop 时图标会被移除、
+/// 从托盘消失。所以这里把 `build()` 的返回值交给 `app.manage()` 持有；
+/// 资源表内部也会保留一份 clone，双保险。
+///
+/// 菜单只有两项：显示主窗口 / 退出。左键单击直接显示窗口（Windows 习惯），
+/// 右键才弹菜单；真正退出应用只有这里（或进程被外部结束）一条路。
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, "tray-show", "显示主窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    let mut builder = TrayIconBuilder::with_id("main-tray")
+        .tooltip("QuarkDownloader")
+        .menu(&menu)
+        // 左键不弹菜单（弹菜单留给右键），改为直接显示主窗口
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray-show" => show_main_window(app),
+            "tray-quit" => {
+                log_line!("[tray] 用户从托盘菜单退出应用");
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // 左键单击（抬起）→ 显示主窗口；Windows 下双击会先派发 Click
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    // 托盘图标复用应用默认图标（tauri.conf.json 的 bundle icons），
+    // 与 exe/任务栏保持一致；取不到就不设图标，交给平台默认值
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+
+    let tray = builder.build(app)?;
+    // 必须常驻：句柄被 drop 时托盘图标会消失
+    let _ = app.manage(tray);
+    log_line!("[tray] 托盘图标已就绪（关闭窗口后仍在托盘运行）");
+    Ok(())
+}
+
 fn main() {
     // 把 panic 变成用户看得见的错误框：否则启动失败（WebView2 缺失、
     // 数据目录不可写、被杀毒软件拦截等）时只会"一闪而过"，无法自查。
@@ -1520,7 +1583,7 @@ fn main() {
         .setup(|app| {
             // 手动创建主窗口（而非 tauri.conf.json 自动创建），
             // 这样才能在 Builder 上注册 on_navigation 回调
-            let _main_window = tauri::WebviewWindowBuilder::new(
+            let main_window = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
@@ -1556,6 +1619,25 @@ fn main() {
             })
             .build()
             .expect("创建主窗口失败");
+
+            // 关闭窗口 = 隐藏到托盘，而不是退出进程。
+            // 内嵌 HTTP 服务与正在跑的下载都活在进程里，用户点“×”通常只是想
+            // 把界面收起来；一旦真的退出，所有下载都会中断。因此这里拦截
+            // CloseRequested 并只隐藏窗口，真正的退出交给托盘菜单的“退出”。
+            let close_window = main_window.clone();
+            main_window.on_window_event(move |event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = close_window.hide();
+                    log_line!("[tray] 主窗口已隐藏到托盘，进程与下载继续运行");
+                }
+            });
+
+            // 系统托盘：窗口隐藏后唯一能唤回界面的入口，必须在 setup 里建好。
+            // 创建失败只记日志，不阻断启动（此时仍可用托盘以外的退出方式）。
+            if let Err(e) = setup_tray(app.handle()) {
+                log_err!("[tray] 创建托盘失败: {}", e);
+            }
 
             // 打印一次当前生效的下载目录，便于排查"文件下到哪去了"
             log_line!("[settings] 下载目录: {:?}", resolve_download_dir(app.handle()));
