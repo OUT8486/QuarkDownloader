@@ -2,7 +2,7 @@
 # 包名同时决定编译产物名（QuarkDownloader.exe）与 CARGO_PKG_NAME，
 # 需与应用显示名（tauri.conf.json 的 productName）、仓库名保持一致。
 name = "QuarkDownloader"
-version = "0.1.1"
+version = "0.2.0"
 description = "QuarkDownloader desktop shell"
 authors = ["quark-team"]
 license = "MIT"
